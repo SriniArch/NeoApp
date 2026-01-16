@@ -25,19 +25,19 @@ from .ltp import fetch_and_update_ltp_once, parse_quote_for_ltp
 # STATE
 # ---------------------------------------------------------
 buy_active = False  # ✅ only one BUY at a time
+last_trade_count = 0 # Track saved trades
 
 
 # ---------------------------------------------------------
 # ROOT
 # ---------------------------------------------------------
 root = tk.Tk()
-root.title("SCALPER PRO")
-root.geometry("340x260")
+root.title("SCALPER & MONITOR PRO")
+root.geometry("680x280")
 root.resizable(False, False)
 root.configure(bg="#f5f5f5")
 icon = tk.PhotoImage(file="assets/scalper2.png")
 root.iconphoto(True, icon)
-
 
 # ---------------------------------------------------------
 # STYLE
@@ -48,6 +48,7 @@ style.theme_use("clam")
 style.configure(".", font=("Segoe UI", 11))
 style.configure("TButton", padding=(6, 3))
 style.configure("TEntry", padding=(6, 4))
+style.configure("TFrame", background="#f5f5f5")
 
 style.configure("Buy.TButton", background="#d1fae5", font=("Segoe UI", 11, "bold"))
 style.map("Buy.TButton", background=[("active", "#a7f3d0")])
@@ -59,17 +60,31 @@ style.configure("CE.TButton", background="#e6f4ea", foreground="#166534")
 style.configure("PE.TButton", background="#fdecea", foreground="#991b1b")
 
 # ---------------------------------------------------------
-# FRAME
+# MAIN LAYOUT
 # ---------------------------------------------------------
-frm = ttk.Frame(root, padding=6)
-frm.pack(fill=tk.BOTH, expand=True)
+main_container = ttk.Frame(root, padding=6)
+main_container.pack(fill=tk.BOTH, expand=True)
 
+# LEFT FRAME (Scalper)
+frm = ttk.Frame(main_container, padding=6)
+frm.pack(side="left", fill="both", expand=True)
+
+# RIGHT FRAME (Monitor)
+mon_frame = ttk.Frame(main_container, padding=6, relief="groove")
+mon_frame.pack(side="right", fill="both", expand=True, padx=(10, 0))
+
+ttk.Label(mon_frame, text="PnL Monitor", font=("Segoe UI", 12, "bold")).pack(anchor="n", pady=(0, 5))
+mon_text = tk.Text(mon_frame, width=32, height=10, bg="#111827", fg="#e5e7eb", font=("Consolas", 10), state="disabled")
+mon_text.pack(fill="both", expand=True)
+
+
+# ---------------------------------------------------------
+# SCALPER UI (Left)
+# ---------------------------------------------------------
 for i in range(4):
     frm.columnconfigure(i, pad=2)
 
-# ---------------------------------------------------------
-# LOG
-# ---------------------------------------------------------
+# LOG BOX
 log_box = tk.Text(
     frm, height=5, width=44,
     bg="#111827", fg="#e5e7eb",
@@ -132,11 +147,6 @@ def update_history(event=None):
     symbol_combo["values"] = current
     save_history(current)
     log_with_callback(log_cb, f"History updated: {new_val}")
-
-# ---------------------------------------------------------
-# TOP BUTTONS REMOVED
-# ---------------------------------------------------------
-# (Login, Load Master, Refresh ATM removed for auto-login)
 
 # ---------------------------------------------------------
 # STRIKE CONTROLS (Row 0)
@@ -273,6 +283,151 @@ def do_exit():
 
 
 # ---------------------------------------------------------
+# MONITOR LOGIC
+# ---------------------------------------------------------
+from monitor.pnl_engine import PositionPnLEngine, parse_api_orders
+
+def color_pnl(val):
+    if val > 0: return "green"
+    if val < 0: return "#ff4444"
+    return "white"
+
+def update_monitor_ui():
+    try:
+        client = get_client() # Get authenticated client
+        if not client:
+            return
+
+        report = client.order_report()
+        if not report or not report.get("data"):
+            # log_cb("Monitor: No data in order report")
+            return
+
+        engine = PositionPnLEngine()
+        trades = parse_api_orders(report["data"])
+        trades.sort(key=lambda x: x.time)
+
+        for t in trades:
+            engine.add_trade(t)
+        
+        # Calculate stats
+        completed = engine.completed_trades
+        pnls = [round(t["net_pnl"]) for t in completed]
+        wins = sum(1 for p in pnls if p > 0)
+        losses = sum(1 for p in pnls if p < 0)
+        win_rate = round((wins / len(pnls) * 100), 1) if pnls else 0.0
+        
+        gross = round(sum(t["gross_pnl"] for t in completed), 2)
+        net = round(sum(t["net_pnl"] for t in completed), 2)
+        charges = round(sum(t["charges"] for t in completed), 2)
+        
+        # Last 5 trades
+        last_5 = pnls[-5:]
+        last_str = " | ".join(str(p) for p in last_5)
+
+        # Build display text
+        lines = [
+            f"Trades: {len(completed)}",
+            f"W/L   : {wins}/{losses} ({win_rate}%)",
+            "-" * 20,
+            f"Gross PnL: {gross}",
+            f"Net PnL  : {net}",
+            f"Charges  : {charges}",
+            "-" * 20,
+            f"Recent: {last_str}"
+        ]
+        
+        # Save to CSV if new trades
+        global last_trade_count
+        if len(completed) != last_trade_count:
+            try:
+                import csv
+                from datetime import datetime
+                
+                date_str = datetime.now().strftime("%Y-%m-%d")
+                filename = f"logs/trades_{date_str}.csv"
+                existing = os.path.exists(filename)
+                
+                # We overwrite/append logic. Since we have FULL list, 
+                # safer is to overwrite OR append only new?
+                # Simplest: Overwrite the daily file with the current full list to avoid dupes/complex merge
+                with open(filename, "w", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["Symbol", "Date", "Buy Time", "Sell Time", "Qty", "Buy Price", "Sell Price", "Gross PnL", "Charges", "Net PnL"])
+                    
+                    for t in completed:
+                        writer.writerow([
+                            t["symbol"],
+                            t.get("trade_date", ""),
+                            t.get("buy_time", ""),
+                            t.get("sell_time", ""),
+                            t.get("buy_qty", 0),
+                            t.get("buy_price", 0),
+                            # Sell price is not stored directly in position dict? 
+                            # We can infer or just store what we have.
+                            # Net PnL = (Sell - Buy) * Qty - Charges
+                            # Sell = (Net + Charges)/Qty + Buy
+                            # Let's check pnl_engine key structure.
+                            # It has 'buy_price', 'gross_pnl', 'charges', 'net_pnl'.
+                            # Sell Average = Buy Price + (Gross PnL / Qty)
+                            t.get("buy_price", 0) + (t.get("gross_pnl", 0) / t.get("buy_qty", 1)),
+                            t.get("gross_pnl", 0),
+                            t.get("charges", 0),
+                            t.get("net_pnl", 0)
+                        ])
+                
+                log_with_callback(log_cb, f"💾 Saved {len(completed)} trades to {filename}")
+                last_trade_count = len(completed)
+            except Exception as e:
+                log_with_callback(log_cb, f"Save CSV Error: {e}")
+
+        # Colorize Net PnL line
+        mon_text.config(state="normal")
+        mon_text.delete("1.0", tk.END)
+        
+        for line in lines:
+            if line.startswith("Recent:"):
+                # Handle Recent line specially to color code individual values
+                mon_text.insert(tk.END, "Recent: ")
+                # Extract the numbers part: "Recent: 50 | -20 | 100" -> "50 | -20 | 100"
+                parts = line.split("Recent: ")[1].split(" | ")
+                
+                for i, p in enumerate(parts):
+                    if not p: continue
+                    try:
+                        val = float(p)
+                        tag = "green" if val > 0 else "red" if val < 0 else None
+                    except:
+                        tag = None
+                    
+                    mon_text.insert(tk.END, p, tag)
+                    if i < len(parts) - 1:
+                        mon_text.insert(tk.END, " | ")
+                
+                mon_text.insert(tk.END, "\n")
+            
+            else:
+                # Handle other lines normally
+                tag = None
+                if line.startswith("Net"):
+                    tag = "green" if net > 0 else "red"
+                elif line.startswith("Gross"):
+                     tag = "green" if gross > 0 else "red"
+                
+                mon_text.insert(tk.END, line + "\n", tag)
+            
+        mon_text.tag_config("green", foreground="#4ade80")
+        mon_text.tag_config("red", foreground="#f87171")
+        mon_text.config(state="disabled")
+
+    except Exception as e:
+        log_with_callback(log_cb, f"Monitor Error: {e}")
+        pass
+    
+    # Schedule next update
+    root.after(5000, lambda: run_bg(update_monitor_ui))
+
+# ---------------------------------------------------------
 # AUTO STARTUP
 # ---------------------------------------------------------
 def startup_sequence():
@@ -281,6 +436,10 @@ def startup_sequence():
         do_login(log_cb)
         load_scrip_master_csv(log_cb=log_cb)
         log_with_callback(log_cb, "✅ Startup Complete")
+        
+        # Start Monitor First Run
+        root.after(2000, lambda: run_bg(update_monitor_ui))
+        
     except Exception as e:
         log_with_callback(log_cb, f"❌ Startup Failed: {e}")
 
