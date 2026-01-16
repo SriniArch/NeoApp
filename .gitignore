@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.envrc
+*.log
+output.json
+symbol_history.json
+.venv/
+*.csv
