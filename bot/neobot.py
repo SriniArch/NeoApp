@@ -54,7 +54,12 @@ def log(msg):
         t = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         msg_str = str(msg)
         print(f"[{t}] {msg_str}")
-        with open("bot_activity.log", "a") as f:
+        
+        # Ensure logs dir exists
+        if not os.path.exists("logs"):
+            os.makedirs("logs")
+            
+        with open("logs/bot_activity.log", "a") as f:
             f.write(f"[{t}] {msg_str}\n")
     except: pass
 
