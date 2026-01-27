@@ -141,15 +141,15 @@ def parse_api_orders(api_data: List[dict]) -> List[Trade]:
 class PositionPnLEngine:
 
     def __init__(self):
-        self.open_trades = {}        # key = symbol
+        self.open_trades = defaultdict(deque)        # key = symbol, value = deque of open positions
         self.completed_trades = []
 
     def add_trade(self, trade: Trade):
         symbol = trade.symbol
 
-        # BUY opens a position (per symbol)
+        # BUY opens or adds to a position (per symbol)
         if trade.side == "B":
-            self.open_trades[symbol] = {
+            self.open_trades[symbol].append({
                 "symbol": symbol,
                 "buy_price": trade.price,
                 "buy_qty": trade.qty,
@@ -157,26 +157,123 @@ class PositionPnLEngine:
                 "buy_time": trade.time,
                 "gross_pnl": 0.0,
                 "charges": 0.0
-            }
+            })
 
-        # SELL reduces position
-        elif trade.side == "S" and symbol in self.open_trades:
-            pos = self.open_trades[symbol]
-            matched_qty = min(trade.qty, pos["open_qty"])
+        # SELL reduces position using FIFO
+        elif trade.side == "S" and self.open_trades.get(symbol):
+            sell_qty = trade.qty
+            
+            while sell_qty > 0 and self.open_trades[symbol]:
+                pos = self.open_trades[symbol][0]
+                matched_qty = min(sell_qty, pos["open_qty"])
 
-            pnl = (trade.price - pos["buy_price"]) * matched_qty
-            turnover = (trade.price + pos["buy_price"]) * matched_qty
-            charges = ChargesCalculator.calculate(turnover, trade.segment)
+                pnl = (trade.price - pos["buy_price"]) * matched_qty
+                turnover = (trade.price + pos["buy_price"]) * matched_qty
+                charges = ChargesCalculator.calculate(turnover, trade.segment)
 
-            pos["gross_pnl"] += pnl
-            pos["charges"] += charges
-            pos["open_qty"] -= matched_qty
+                pos["gross_pnl"] += pnl
+                pos["charges"] += charges
+                pos["open_qty"] -= matched_qty
+                sell_qty -= matched_qty
 
-            # Position fully closed
-            if pos["open_qty"] == 0:
-                pos["net_pnl"] = round(pos["gross_pnl"] - pos["charges"], 2)
-                pos["sell_time"] = trade.time
-                pos["trade_date"] = trade.time.date()
+                # Position fully closed for this buy lot
+                if pos["open_qty"] == 0:
+                    pos["net_pnl"] = round(pos["gross_pnl"] - pos["charges"], 2)
+                    pos["sell_price"] = trade.price
+                    pos["sell_time"] = trade.time
+                    pos["trade_date"] = trade.time.date()
 
-                self.completed_trades.append(pos)
+                    self.completed_trades.append(pos)
+                    self.open_trades[symbol].popleft()
+            
+            if not self.open_trades[symbol]:
                 del self.open_trades[symbol]
+
+    def hourly_summary(self, for_date=None) -> Dict[str, int]:
+        """
+        Return a dict of hourly trade counts for the given date.
+        Keys are labeled like '09:00-10:00'. If `for_date` is None,
+        uses today's date.
+        """
+        counts = defaultdict(int)
+
+        if for_date is None:
+            for_date = datetime.now().date()
+
+        for t in self.completed_trades:
+            st = t.get("sell_time")
+            if not st:
+                continue
+            if st.date() != for_date:
+                continue
+            counts[st.hour] += 1
+
+        # Build labeled dict for all 24 hours
+        hourly = {}
+        for h in range(24):
+            label = f"{h:02d}:00-{(h+1)%24:02d}:00"
+            hourly[label] = counts.get(h, 0)
+
+        return hourly
+
+    def trading_hours_summary(self, start_time="09:15", end_time="15:30", slot_minutes=60, for_date=None) -> Dict:
+        """
+        Compute trade counts for consecutive slots between `start_time` and `end_time`.
+        Default trading window is 09:15 to 15:30. Slots are `slot_minutes` long.
+
+        Returns a dict with:
+          - 'slots': Ordered dict label -> count (labels like '09:15-10:15')
+          - 'total_trades': int
+          - 'total_hours': float (hours)
+          - 'avg_per_hour': float
+        """
+        from datetime import datetime, date, time, timedelta
+        from collections import OrderedDict
+
+        if for_date is None:
+            for_date = datetime.now().date()
+
+        # parse start/end times
+        sh, sm = map(int, start_time.split(":"))
+        eh, em = map(int, end_time.split(":"))
+
+        start_dt = datetime.combine(for_date, time(sh, sm))
+        end_dt = datetime.combine(for_date, time(eh, em))
+
+        # Build slots
+        slots = OrderedDict()
+        cur = start_dt
+        delta = timedelta(minutes=slot_minutes)
+        while cur < end_dt:
+            nxt = min(cur + delta, end_dt)
+            label = f"{cur.strftime('%H:%M')}-{nxt.strftime('%H:%M')}"
+            slots[label] = 0
+            cur = nxt
+
+        total = 0
+        for t in self.completed_trades:
+            st = t.get("sell_time")
+            if not st:
+                continue
+            if st.date() != for_date:
+                continue
+
+            # find slot
+            for label in slots:
+                parts = label.split("-")
+                s_part = datetime.combine(for_date, datetime.strptime(parts[0], "%H:%M").time())
+                e_part = datetime.combine(for_date, datetime.strptime(parts[1], "%H:%M").time())
+                if s_part <= st < e_part:
+                    slots[label] += 1
+                    total += 1
+                    break
+
+        total_hours = (end_dt - start_dt).total_seconds() / 3600.0
+        avg_per_hour = round((total / total_hours) if total_hours > 0 else 0.0, 2)
+
+        return {
+            "slots": slots,
+            "total_trades": total,
+            "total_hours": round(total_hours, 2),
+            "avg_per_hour": avg_per_hour
+        }

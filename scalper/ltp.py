@@ -1,87 +1,109 @@
-import sys
+"""LTP quotes logger
+
+Provides a small utility to periodically fetch LTPs for a list of
+instrument tokens and append them to a CSV. The function is lightweight
+and safe to run in a daemon thread from the monitor.
+"""
+
 import os
-from typing import Optional, Callable, Any, List, Dict
+import csv
+import threading
+import datetime
+from typing import List, Dict, Any
 
-# Allow importing from parent directory
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from common.utils import run_bg, log_with_callback
-from common.orders import get_client
-from common.scrip_master import find_token_for_trading_symbol
+def _parse_quotes_response(resp: Any) -> Dict[str, float]:
+	"""Return mapping instrument_token -> ltp from typical quote responses.
 
-def parse_quote_for_ltp(resp: Any) -> Optional[float]:
-    """
-    Minimal LTP extraction based on actual response formats.
-    """
-    try:
-        # Case 1: response is list of dicts (your example)
-        if isinstance(resp, list) and len(resp) > 0 and isinstance(resp[0], dict):
-            d0 = resp[0]
-            if "ltp" in d0:
-                return float(d0["ltp"])
+	Supports responses that are either a list of dicts or a dict with
+	a `data` list. Each item is expected to contain `instrument_token`
+	and `ltp` keys (best-effort extraction).
+	"""
+	items = []
+	if isinstance(resp, dict):
+		data = resp.get("data")
+		if isinstance(data, list):
+			items = data
+	elif isinstance(resp, list):
+		items = resp
 
-        # Case 2: response is dict with "data" → list of dicts (older format)
-        if isinstance(resp, dict):
-            data = resp.get("data")
-            if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
-                d0 = data[0]
-                if "ltp" in d0:
-                    return float(d0["ltp"])
+	out = {}
+	for it in items:
+		if not isinstance(it, dict):
+			continue
+		tok = it.get("instrument_token") or it.get("instrumentToken") or it.get("token")
+		ltp = it.get("ltp") or it.get("last_price") or it.get("last")
+		if tok is None:
+			continue
+		try:
+			out[str(tok)] = float(ltp) if ltp is not None else None
+		except Exception:
+			out[str(tok)] = None
 
-        return None
+	return out
 
-    except Exception:
-        return None
 
-def fetch_and_update_ltp_once(trading_symbol: str,
-                             update_label_cb: Optional[Callable[[str], None]] = None,
-                             log_cb: Optional[Callable[[str], None]] = None) -> None:
-    """
-    Fetch LTP for a trading symbol (trading_symbol is the human trading symbol like NIFTY25NOV24850CE).
-    This function will attempt to resolve to instrument token via scrip_master and then call client.quotes.
-    """
-    try:
-        tr = trading_symbol
-        if not tr or tr == "Not found":
-            return
-        token = find_token_for_trading_symbol(tr, log_cb=log_cb)
-        if not token:
-            log_with_callback(log_cb, f"No token for {tr} (load scrip master first?)")
-            return
-        instrument_tokens = [{"instrument_token": str(token), "exchange_segment": "nse_fo"}]
+def fetch_quotes_once(client, instrument_tokens: List[Dict[str, str]]) -> Dict[str, float]:
+	"""Fetch quotes via client.quotes and return token->ltp mapping.
 
-        #log_with_callback(log_cb, f"Fetching LTP for {tr} (token {token})...")
-        client = get_client()
-        if client is None:
-            log_with_callback(log_cb, "No client - not calling quotes")
-            return
+	`instrument_tokens` should be the same structure passed to the API
+	(list of dicts with `instrument_token` and `exchange_segment`).
+	"""
+	try:
+		resp = client.quotes(instrument_tokens=instrument_tokens, quote_type="ltp")
+	except Exception as e:
+		return {"__error__": str(e)}
 
-        try:
-            resp = client.quotes(instrument_tokens=instrument_tokens, quote_type="ltp")
-            #log_with_callback(log_cb, f"quotes response: {resp}")
-        except Exception as e:
-            log_with_callback(log_cb, f"quotes call error: {e}")
-            return
+	return _parse_quotes_response(resp)
 
-        ltp = parse_quote_for_ltp(resp)
-        update_label_cb(f"LTP: {ltp}")
-        
-    except Exception as e:
-        log_with_callback(log_cb, f"fetch_and_update_ltp_once error: {e}")
 
-def start_ltp_auto_loop(root, trading_symbol_getter: Callable[[], str],
-                        update_label_cb: Optional[Callable[[str], None]] = None,
-                        log_cb: Optional[Callable[[str], None]] = None,
-                        interval_ms: int = 2000):
-    """
-    Start an LTP auto loop using tkinter's `root.after`. The function schedules
-    a background fetch and re-schedules itself. It returns immediately.
-    """
-    def _loop():
-        # schedule background fetch
-        tr = trading_symbol_getter()
-        run_bg(fetch_and_update_ltp_once, tr, update_label_cb, log_cb)
-        root.after(interval_ms, _loop)
+def start_quotes_logger(client, instrument_tokens: List[Dict[str, str]],
+						csv_path: str = "logs/ltp_quotes.csv", interval: int = 10,
+						stop_event: threading.Event = None) -> None:
+	"""Periodically fetch LTPs and append to `csv_path` every `interval` seconds.
 
-    # first call
-    root.after(interval_ms, _loop)
+	Safe to run as a daemon thread. Each fetch appends one row per
+	instrument with columns: timestamp, instrument_token, exchange_segment, ltp
+	"""
+	os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+	# prepare header if needed
+	header = ["timestamp", "instrument_token", "exchange_segment", "ltp"]
+	if not os.path.exists(csv_path):
+		try:
+			with open(csv_path, "w", newline="") as f:
+				writer = csv.writer(f)
+				writer.writerow(header)
+		except Exception:
+			pass
+
+	if stop_event is None:
+		stop_event = threading.Event()
+
+	while not stop_event.is_set():
+		ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+		try:
+			parsed = fetch_quotes_once(client, instrument_tokens)
+
+			rows = []
+			for itm in instrument_tokens:
+				tok = str(itm.get("instrument_token"))
+				exch = itm.get("exchange_segment", "")
+				ltp = parsed.get(tok)
+				rows.append([ts, tok, exch, ltp])
+
+			with open(csv_path, "a", newline="") as f:
+				writer = csv.writer(f)
+				writer.writerows(rows)
+
+		except Exception as e:
+			# write an error row so we have visibility
+			try:
+				with open(csv_path, "a", newline="") as f:
+					writer = csv.writer(f)
+					writer.writerow([ts, "ERROR", "", str(e)])
+			except Exception:
+				pass
+
+		stop_event.wait(interval)
+

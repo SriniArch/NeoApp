@@ -14,5 +14,23 @@ LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "75"))
 # Scrip Master constants
 NSE_SCRIP_MASTER_PATH = os.getenv("NSE_SCRIP_MASTER_PATH", "nse_fo.csv")
 BSE_SCRIP_MASTER_PATH = os.getenv("BSE_SCRIP_MASTER_PATH", "bse_fo.csv")
-DEFAULT_TRADING_SYMBOL = "SENSEX2610184900PE"
+DEFAULT_TRADING_SYMBOL = "NIFTY2612025300CE"
 EXPIRY_STR = "26120" # YYMDD format (e.g. 26120 for 20th Jan 2026)
+
+# Buy disable feature
+ENABLE_BUY_DISABLE = True
+BUY_DISABLE_LOSS_COUNT = 3  # Number of continuous losses to disable buying
+BUY_DISABLE_DURATION = 120  # seconds
+BUY_DISABLE_MAX_LOSS = 500   # Disable buying if net loss exceeds this amount
+BUY_DISABLE_MAX_PROFIT = 1000 # Disable buying if net profit exceeds this amount
+
+# Per-trade default risk management
+DEFAULT_TARGET = 2.0
+DEFAULT_SL = 2.0
+DEFAULT_TSL_STEP = 1.0 # Points move required to trail SL (0 to disable)
+
+# LTP Logger feature
+ENABLE_LTP_LOGGER = False
+
+# UI & Strategy refresh interval in milliseconds
+REFRESH_INTERVAL_MS = 1000
