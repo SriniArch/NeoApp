@@ -13,8 +13,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.utils import log_with_callback, run_bg
 from common.scrip_master import load_scrip_master_csv, find_token_for_trading_symbol
 from common.orders import ensure_login as do_login, place_market_order, get_client, detect_exchange_segment, detect_strike_step
-from common.config import DEFAULT_TRADING_SYMBOL, ENABLE_BUY_DISABLE, BUY_DISABLE_DURATION, BUY_DISABLE_LOSS_COUNT, BUY_DISABLE_MAX_LOSS, BUY_DISABLE_MAX_PROFIT, REFRESH_INTERVAL_MS, DEFAULT_TARGET, DEFAULT_SL, DEFAULT_TSL_STEP
+from common.config import DEFAULT_TRADING_SYMBOL, ENABLE_BUY_DISABLE, BUY_DISABLE_DURATION, BUY_DISABLE_LOSS_COUNT, BUY_DISABLE_MAX_LOSS, BUY_DISABLE_MAX_PROFIT, RESET_OVERRIDE_DURATION, REFRESH_INTERVAL_MS, DEFAULT_TARGET, DEFAULT_SL, DEFAULT_TSL_STEP, COOL_OFF_PERIOD
 from indicator.scalping_indicator import LiveScalpingManager
+from monitor.pnl_engine import PositionPnLEngine, parse_api_orders
 import json
 import time
 
@@ -30,15 +31,21 @@ HISTORY_FILE = "symbol_history.json"
 # STATE
 # ---------------------------------------------------------
 buy_active = False  # ✅ only one BUY at a time
+buy_pending = False # ⏳ Track if a BUY order is currently being placed
+exit_pending = False # ⌛ Track if an EXIT order is currently being placed
+active_symbol = ""  # 🏷️ The exact symbol of the current open position
 buy_disabled = False  # Track if buy is disabled due to losses
 last_trade_count = 0 # Track saved trades
 last_display_content = "" # Cache last displayed content to prevent flickering
 scalp_manager = LiveScalpingManager()
-override_until = 0  # 10-min grace period for manual override
+override_until = 0  # Grace period for manual override (RESET_OVERRIDE_DURATION)
 auto_mode = False   # Automated trading status
 last_buy_price = 0.0 # Entry price of current active position
 max_price_seen = 0.0 # Peak price for trailing SL tracking
 active_trade_metadata = {} # Snapshot of indicators at entry/exit
+last_exit_reason = "" # Track last exit reason for logging
+last_exit_time = 0   # ⏱️ Track when the last trade ended for cool-off period
+pnl_engine = PositionPnLEngine() # Shared engine for PnL tracking
 
 
 # ---------------------------------------------------------
@@ -46,7 +53,7 @@ active_trade_metadata = {} # Snapshot of indicators at entry/exit
 # ---------------------------------------------------------
 root = tk.Tk()
 root.title("SCALPER & MONITOR PRO")
-root.geometry("850x380")
+root.geometry("850x340")
 root.resizable(True, True)
 root.configure(bg="#f5f5f5")
 icon = tk.PhotoImage(file="assets/scalper2.png")
@@ -108,7 +115,7 @@ log_box = tk.Text(
     relief="flat",
     font=("Consolas", 10)
 )
-log_box.grid(row=20, column=0, columnspan=5, pady=(10, 0))
+log_box.grid(row=6, column=0, columnspan=5, pady=(5, 0))
 
 def log_cb(msg):
     def _update():
@@ -116,23 +123,24 @@ def log_cb(msg):
         log_box.see(tk.END)
     root.after(0, _update)
 
+
 # ---------------------------------------------------------
 # SYMBOL HELPERS
 # ---------------------------------------------------------
+
 def get_underlying_index(symbol: str):
     """Maps trading symbol to its underlying index and exchange."""
     s = symbol.upper()
     if "NIFTY" in s:
         if "BANK" in s:
-            return "Nifty Bank", "nse_cm"
+            return "99926009", "nse_cm" # Nifty Bank
         elif "FIN" in s:
-            return "Nifty Fin Service", "nse_cm"
-        return "Nifty 50", "nse_cm"
+            return "99926037", "nse_cm" # FINNIFTY
+        return "99926000", "nse_cm" # Nifty 50
     elif "SENSEX" in s or "BSX" in s:
-        return "SENSEX", "bse_cm"
+        return "1", "bse_cm" # SENSEX
     elif "BANKEX" in s:
-        return "BANKEX", "bse_cm"
-    # Fallback to symbol itself if no index match
+        return "12", "bse_cm" # BANKEX
     return None, None
 
 def update_symbol_strike(symbol: str, new_strike: int) -> str:
@@ -249,11 +257,11 @@ symbol_combo.bind("<Return>", update_history)
 
 # 5️⃣ CONTROL BUTTONS (Row 4)
 btn_frame = ttk.Frame(frm)
-btn_frame.grid(row=4, column=0, columnspan=6, pady=15)
+btn_frame.grid(row=4, column=0, columnspan=6, pady=(10, 2))
 
 buy_btn = ttk.Button(
     btn_frame, text="BUY", style="Buy.TButton", width=12,
-    command=lambda: run_bg(do_buy)
+    command=lambda: run_bg(do_buy, trade_type="Manual")
 )
 buy_btn.pack(side="left", padx=10)
 
@@ -273,11 +281,18 @@ auto_btn = ttk.Button(
 )
 auto_btn.pack(side="left", padx=10)
 
-status_label = ttk.Label(frm, text="Buy Enabled", font=("Segoe UI", 10))
-status_label.grid(row=5, column=0, columnspan=6, pady=(5, 0))
+# 5.5️⃣ STATUS BAR (Row 5)
+status_frame = ttk.Frame(frm)
+status_frame.grid(row=5, column=0, columnspan=6, pady=(2, 5), sticky="ew")
 
-strategy_status_label = ttk.Label(frm, text="Strategy: Waiting...", font=("Segoe UI", 10, "bold"))
-strategy_status_label.grid(row=6, column=0, columnspan=6, pady=(0, 5))
+status_label = ttk.Label(status_frame, text="Buy Enabled", font=("Segoe UI", 10))
+status_label.pack(side="left", padx=(5, 0))
+
+position_label = ttk.Label(status_frame, text="● NO POSITION", font=("Segoe UI", 10, "bold"), foreground="gray")
+position_label.pack(side="left", padx=(20, 0))
+
+strategy_status_label = ttk.Label(status_frame, text="Strategy: Waiting...", font=("Segoe UI", 10, "bold"))
+strategy_status_label.pack(side="right", padx=(0, 5))
 
 # ---------------------------------------------------------
 # LOGIC
@@ -310,14 +325,15 @@ def is_buy_disabled():
 
 def trigger_override():
     global override_until
-    override_until = time.time() + 600  # 10 minutes
+    override_until = time.time() + RESET_OVERRIDE_DURATION
     if os.path.exists(BUY_DISABLED_FILE):
         try:
             os.remove(BUY_DISABLED_FILE)
             log_with_callback(log_cb, "✅ Manual Override: Persistent lockout cleared.")
         except: pass
     else:
-        log_with_callback(log_cb, "✅ Manual Override: Buy enabled for 10 minutes.")
+        mins = RESET_OVERRIDE_DURATION // 60
+        log_with_callback(log_cb, f"✅ Manual Override: Buy enabled for {mins} minutes.")
     update_status_label()
 
 def toggle_auto_mode():
@@ -357,15 +373,21 @@ def update_status_label():
             secs = int(remaining % 60)
             status_label.config(text=f"Buy Disabled - Re-enables in {mins}:{secs:02d}", foreground="red")
     else:
-        if not buy_active:
-            buy_btn.config(state="normal")
-        status_label.config(text="Buy Enabled", foreground="green")
+        # Check Cool-off period
+        time_since_exit = time.time() - last_exit_time
+        if time_since_exit < COOL_OFF_PERIOD:
+            remaining_cool = int(COOL_OFF_PERIOD - time_since_exit)
+            buy_btn.config(state="disabled")
+            status_label.config(text=f"Cooling Off... ({remaining_cool}s)", foreground="#f59e0b")
+        else:
+            if not buy_active:
+                buy_btn.config(state="normal")
+            status_label.config(text="Buy Enabled", foreground="green")
     root.after(1000, update_status_label)
 
 
-def do_buy():
-    global buy_active
-    global last_buy_price
+def do_buy(trade_type="Manual"):
+    global buy_active, buy_pending, active_symbol, last_buy_price, max_price_seen, active_trade_metadata, last_exit_time
 
     disabled, remaining, reason = is_buy_disabled()
     if disabled:
@@ -381,9 +403,40 @@ def do_buy():
         root.after(0, lambda: messagebox.showerror("Buy Disabled", msg))
         return
 
-    if buy_active:
-        log_with_callback(log_cb, "BUY blocked: position already open")
+    if buy_active or buy_pending:
+        log_with_callback(log_cb, f"BUY blocked: {'Pending' if buy_pending else 'Position'} already active")
         return
+
+    # Check Cool-off Period
+    time_since_exit = time.time() - last_exit_time
+    if time_since_exit < COOL_OFF_PERIOD:
+        remaining = int(COOL_OFF_PERIOD - time_since_exit)
+        log_with_callback(log_cb, f"BUY blocked: Cool-off period active ({remaining}s remaining)")
+        return
+
+    tr = tr_symbol.get().strip().upper()
+    if not tr:
+        messagebox.showerror("Error", "Trading symbol is empty")
+        return
+
+    # 🔒 Lock entering phase
+    buy_pending = True
+    active_symbol = tr
+
+    # Double check with API for open positions
+    try:
+        client = get_client()
+        if client:
+            pos_resp = client.positions()
+            data = pos_resp.get("data", []) if isinstance(pos_resp, dict) else pos_resp
+            if isinstance(data, list):
+                for p in data:
+                    if int(float(p.get("netQty", p.get("flQty", 0)))) != 0:
+                        log_with_callback(log_cb, f"BUY blocked: API shows open position in {p.get('trdSym')}")
+                        buy_active = True
+                        return
+    except Exception as e:
+        log_with_callback(log_cb, f"⚠️ Position Check Error: {e}")
 
     tr = tr_symbol.get().strip()
     if not tr:
@@ -404,21 +457,37 @@ def do_buy():
             exch = detect_exchange_segment(tr)
             q = client.quotes(instrument_tokens=[{"instrument_token": token, "exchange_segment": exch}], quote_type="ltp")
             ltp = 0
-            if isinstance(q, list) and len(q) > 0: ltp = float(q[0].get("ltp", 0))
-            elif isinstance(q, dict): ltp = float(q.get("data", [{}])[0].get("ltp", 0))
+            if isinstance(q, list) and len(q) > 0: 
+                ltp = float(q[0].get("ltp", 0))
+            elif isinstance(q, dict): 
+                data = q.get("data", [])
+                if isinstance(data, list) and len(data) > 0:
+                    ltp = float(data[0].get("ltp", 0))
             
-            last_buy_price = ltp
-            global max_price_seen
-            max_price_seen = ltp
-            log_with_callback(log_cb, f"Initial LTP Captured: {last_buy_price}")
-    except: pass
+            if ltp > 0:
+                last_buy_price = ltp
+                max_price_seen = ltp
+                log_with_callback(log_cb, f"Initial LTP Captured: {last_buy_price}")
+            else:
+                log_with_callback(log_cb, "⚠️ Warning: Initial LTP capture returned 0")
+    except Exception as e:
+        log_with_callback(log_cb, f"⚠️ LTP Fetch Error: {e}")
 
     # Place order and capture response
-    resp = place_market_order(token, int(lots_var.get()), "BUY", tr, log_cb)
+    try:
+        resp = place_market_order(token, int(lots_var.get()), "BUY", tr, log_cb)
+    except Exception as e:
+        log_with_callback(log_cb, f"❌ BUY ORDER ERROR: {e}")
+        buy_pending = False
+        active_symbol = ""
+        root.after(0, lambda: buy_btn.config(state="normal"))
+        return
 
     # 🎯 Verify if order was actually placed
     if not (isinstance(resp, dict) and "nOrdNo" in resp):
         log_with_callback(log_cb, f"❌ BUY FAILED: {resp.get('errMsg', 'Unknown Error') if isinstance(resp, dict) else 'Invalid Response'}")
+        buy_pending = False
+        active_symbol = ""
         root.after(0, lambda: buy_btn.config(state="normal"))
         return
 
@@ -426,63 +495,127 @@ def do_buy():
 
     # 🎯 Verify if order was actually COMPLETED
     is_completed = False
+    status = "unknown"
     try:
         if client:
             log_with_callback(log_cb, f"Verifying completion for Order: {order_id}...")
-            # Fetch history to check status and avg price
-            history = client.order_history(order_id=order_id)
-            if history and isinstance(history, list):
-                # Check most recent state
-                latest_state = history[-1]
-                status = latest_state.get("ordSt", "").lower()
+            
+            # Retry loop for order status (API can be slow)
+            for attempt in range(6): # 6 attempts * 0.5s = 3s total
+                time.sleep(0.5) 
+                history_resp = client.order_history(order_id=order_id)
+                print(f"DEBUG: Order History Response (BUY) for {order_id}: {history_resp}")
                 
-                if status == "complete":
-                    is_completed = True
-                    for state in reversed(history):
-                        avg_prc = state.get("avgPrc")
-                        if avg_prc and float(avg_prc) > 0:
-                            last_buy_price = float(avg_prc)
-                            max_price_seen = last_buy_price
-                            break
-                elif status == "rejected":
-                    reason = latest_state.get("rejReason", "Unknown Reason")
-                    log_with_callback(log_cb, f"❌ BUY REJECTED: {reason}")
-                else:
-                    log_with_callback(log_cb, f"⚠️ BUY Status: {status}")
+                # Handle both list and dict-with-data formats
+                history = history_resp if isinstance(history_resp, list) else history_resp.get("data", []) if isinstance(history_resp, dict) else []
+                
+                if history and isinstance(history, list):
+                    latest_state = history[-1]
+                    status = latest_state.get("ordSt", "").lower()
+                    
+                    if status == "complete":
+                        is_completed = True
+                        for state in reversed(history):
+                            # Check multiple possible keys for average price
+                            avg_p = state.get("avgPrc") or state.get("buyAvgPrc") or state.get("price")
+                            if avg_p and float(avg_p) > 0:
+                                last_buy_price = float(avg_p)
+                                max_price_seen = last_buy_price
+                                break
+                        break # Success!
+                    elif status == "rejected":
+                        reason = latest_state.get("rejReason", "Unknown Reason")
+                        log_with_callback(log_cb, f"❌ BUY REJECTED: {reason}")
+                        break
+                    else:
+                        # Continue retrying if status is not final
+                        pass
+                
+            if not is_completed and status != "rejected":
+                # Fallback: Check Order Report for this ID
+                try:
+                    rep = client.order_report()
+                    rep_data = rep.get("data", []) if isinstance(rep, dict) else rep
+                    if isinstance(rep_data, list):
+                        for o in rep_data:
+                            if str(o.get("nOrdNo")) == str(order_id) and str(o.get("ordSt", "")).lower() == "complete":
+                                is_completed = True
+                                avg_p = o.get("avgPrc") or o.get("buyAvgPrc") or o.get("price")
+                                if avg_p: last_buy_price = float(avg_p)
+                                break
+                except: pass
+                
+            if not is_completed and status != "rejected":
+                log_with_callback(log_cb, f"⚠️ Verification Timeout: Order {order_id} status is still {status}")
+                
     except Exception as e:
         log_with_callback(log_cb, f"Verification Error: {e}")
 
     if not is_completed:
+        # Check if we can recover from positions even if verification timed out
+        try:
+            pos_resp = client.positions()
+            data = pos_resp.get("data", []) if isinstance(pos_resp, dict) else pos_resp
+            if isinstance(data, list):
+                for p in data:
+                    if p.get("trdSym", "").upper() == active_symbol.upper() and int(float(p.get("netQty", 0))) != 0:
+                        log_with_callback(log_cb, "🛡️ RECOVERED: Order verification timed out, but Position is open in API. Resuming...")
+                        is_completed = True
+                        # Check multiple keys in position data too
+                        recovered_p = p.get("avgPrc") or p.get("buyAvgPrc") or p.get("buyAvg")
+                        if recovered_p and float(recovered_p) > 0:
+                            last_buy_price = float(recovered_p)
+                        break
+        except: pass
+
+    if not is_completed:
+        buy_pending = False
+        active_symbol = ""
         root.after(0, lambda: buy_btn.config(state="normal"))
         return
 
-    buy_active = True  # ✅ BUY position now active
+    buy_active = True  
+    buy_pending = False # Done
     
     # Capture Entry Indicators
-    global active_trade_metadata
     try:
         ind = scalp_manager.get_signal()
         active_trade_metadata = {
+            "trade_type": trade_type,
             "entry_sig": ind.get("signal"),
             "entry_ema": ind.get("ema"),
             "entry_roc": ind.get("roc"),
             "entry_bbw": ind.get("bb_width"),
+            "entry_time_ts": time.time(), # For time-stop
             "exit_reason": "IN_PROGRESS"
         }
     except: active_trade_metadata = {}
 
-    log_with_callback(log_cb, f"✅ BUY completed at {last_buy_price} – waiting for SELL")
+    tgt_pts = float(target_var.get() or 0)
+    sl_pts = float(sl_var.get() or 0)
+    tgt_price = round(last_buy_price + tgt_pts, 2)
+    sl_price = round(last_buy_price - sl_pts, 2)
+
+    log_with_callback(log_cb, f"🎯 Confirmed BUY Executed @ {last_buy_price}")
+    log_with_callback(log_cb, f"📊 Target: {tgt_price} (+{tgt_pts}) | SL: {sl_price} (-{sl_pts})")
+    log_with_callback(log_cb, f"✅ BUY completed - waiting for SELL")
 
 
 def do_exit(reason="Manual"):
-    global buy_active
-    global active_trade_metadata
+    global buy_active, exit_pending, active_symbol, active_trade_metadata
 
-    tr = tr_symbol.get().strip()
+    # Use the symbol we actually BOUGHT, not whatever is currently in the entry box
+    tr = active_symbol if active_symbol else tr_symbol.get().strip().upper()
+    
     if not tr:
-        messagebox.showerror("Error", "Trading symbol is empty")
+        log_with_callback(log_cb, "❌ EXIT Error: No active symbol tracked.")
         return
-
+    
+    if exit_pending:
+        log_with_callback(log_cb, "⌛ EXIT blocked: Exit order already pending")
+        return
+    
+    exit_pending = True
     # Capture Exit Indicators before placing order
     try:
         ind = scalp_manager.get_signal()
@@ -496,11 +629,17 @@ def do_exit(reason="Manual"):
     except: pass
 
     token = find_token_for_trading_symbol(tr, log_cb)
-    resp = place_market_order(token, int(lots_var.get()), "SELL", tr, log_cb)
-    
+    try:
+        resp = place_market_order(token, int(lots_var.get()), "SELL", tr, log_cb)
+    except Exception as e:
+        log_with_callback(log_cb, f"❌ SELL ORDER ERROR: {e}")
+        exit_pending = False
+        return
+
     # 🎯 Verify if order was actually placed
     if not (isinstance(resp, dict) and "nOrdNo" in resp):
         log_with_callback(log_cb, f"❌ SELL FAILED: {resp.get('errMsg', 'Unknown Error') if isinstance(resp, dict) else 'Invalid Response'}")
+        exit_pending = False
         return
 
     order_id = resp["nOrdNo"]
@@ -508,44 +647,79 @@ def do_exit(reason="Manual"):
     # Capture Execution Price for SELL and Verify Completion
     sell_price = 0.0
     is_completed = False
+    status = "unknown"
     try:
         client = get_client()
         if client:
-            time.sleep(0.5) # Small buffer for exchange confirmation
-            history = client.order_history(order_id=order_id)
-            if history and isinstance(history, list):
-                latest_state = history[-1]
-                status = latest_state.get("ordSt", "").lower()
+            log_with_callback(log_cb, f"Verifying completion for SELL Order: {order_id}...")
+            # Retry loop for order status (API can be slow)
+            for attempt in range(6): # 6 attempts * 0.5s = 3s total
+                time.sleep(0.5) 
+                history_resp = client.order_history(order_id=order_id)
+                print(f"DEBUG: Order History Response (SELL) for {order_id}: {history_resp}")
+                
+                # Handle both list and dict-with-data formats
+                history = history_resp if isinstance(history_resp, list) else history_resp.get("data", []) if isinstance(history_resp, dict) else []
+                
+                if history and isinstance(history, list):
+                    latest_state = history[-1]
+                    status = latest_state.get("ordSt", "").lower()
 
-                if status == "complete":
-                    is_completed = True
-                    for state in reversed(history):
-                        avg_prc = state.get("avgPrc")
-                        if avg_prc and float(avg_prc) > 0:
-                            sell_price = float(avg_prc)
-                            break
-                elif status == "rejected":
-                    reason = latest_state.get("rejReason", "Unknown Reason")
-                    log_with_callback(log_cb, f"❌ SELL REJECTED: {reason}")
-    except: pass
+                    if status == "complete":
+                        is_completed = True
+                        for state in reversed(history):
+                            # Check multiple possible keys for average price
+                            avg_p = state.get("avgPrc") or state.get("sellAvgPrc") or state.get("price")
+                            if avg_p and float(avg_p) > 0:
+                                sell_price = float(avg_p)
+                                break
+                        break 
+                    elif status == "rejected":
+                        reason = latest_state.get("rejReason", "Unknown Reason")
+                        log_with_callback(log_cb, f"❌ SELL REJECTED: {reason}")
+                        break
+            
+            if not is_completed and status != "rejected":
+                # Fallback: Check Order Report for this ID
+                try:
+                    rep = client.order_report()
+                    rep_data = rep.get("data", []) if isinstance(rep, dict) else rep
+                    if isinstance(rep_data, list):
+                        for o in rep_data:
+                            if str(o.get("nOrdNo")) == str(order_id) and str(o.get("ordSt", "")).lower() == "complete":
+                                is_completed = True
+                                avg_p = o.get("avgPrc") or o.get("sellAvgPrc") or o.get("price")
+                                if avg_p: sell_price = float(avg_p)
+                                break
+                except: pass
+
+            if not is_completed and status != "rejected":
+                log_with_callback(log_cb, f"⚠️ SELL Timeout: Order {order_id} status is still {status}")
+
+    except Exception as e:
+        log_with_callback(log_cb, f"SELL Verification Error: {e}")
 
     if not is_completed:
-        # If sell failed, we are still buy_active!
+        exit_pending = False # Reset so we can try again
         return
 
-    buy_active = False               # ✅ position closed
-    root.after(0, lambda: buy_btn.config(state="normal"))   # 🔓 BUY enabled again
+    buy_active = False               
+    exit_pending = False
+    active_symbol = ""
+    global last_exit_time
+    last_exit_time = time.time() # Start cool-off period
+    root.after(0, lambda: buy_btn.config(state="normal"))
     
-    log_msg = f"✅ SELL completed @ {sell_price if sell_price > 0 else 'MARKET'}"
+    log_msg = f"🎯 Confirmed SELL Executed @ {sell_price if sell_price > 0 else 'MARKET'}"
     if reason != "Manual":
         log_msg += f" [{reason}]"
     log_with_callback(log_cb, log_msg)
+    log_with_callback(log_cb, "✅ POSITION CLOSED")
 
 
 # ---------------------------------------------------------
 # MONITOR LOGIC
 # ---------------------------------------------------------
-from monitor.pnl_engine import PositionPnLEngine, parse_api_orders
 
 def color_pnl(val):
     if val > 0: return "green"
@@ -554,36 +728,88 @@ def color_pnl(val):
 
 def update_monitor_ui():
     """Background worker to fetch and process PnL data."""
+    global pnl_engine, active_symbol, last_buy_price, max_price_seen, buy_active, last_trade_count, active_trade_metadata
     try:
         client = get_client()
         if not client:
             return
 
+        # 1. POSITION SYNC (Source of Truth)
+        try:
+            pos_resp = client.positions()
+            data = pos_resp.get("data", []) if isinstance(pos_resp, dict) else pos_resp
+            has_open_pos = False
+            if isinstance(data, list):
+                if data:
+                    print(f"DEBUG: Raw Position Response: {data[0]}")
+                for p in data:
+                    # 🛡️ BSE FO Fallback: If netQty is missing, calculate from fills
+                    fl_buy = float(p.get("flBuyQty", 0))
+                    fl_sell = float(p.get("flSellQty", 0))
+                    qty = int(float(p.get("netQty", fl_buy - fl_sell)))
+                    
+                    if qty != 0:
+                        has_open_pos = True
+                        # 🛡️ AUTO-RECOVERY from positions API (Source of Truth)
+                        if not active_symbol or last_buy_price <= 0:
+                             active_symbol = p.get("trdSym", "").upper()
+                             # Check multiple possible keys for average price in positions
+                             recovered_p = p.get("avgPrc") or p.get("buyAvgPrc") or p.get("buyAvg")
+                             
+                             # BSE Fallback: Price = BuyAmt / flBuyQty
+                             if not recovered_p or float(recovered_p) == 0:
+                                 buy_amt = float(p.get("buyAmt", 0))
+                                 if fl_buy > 0: recovered_p = buy_amt / fl_buy
+                             
+                             last_buy_price = float(recovered_p or 0)
+                             if last_buy_price > 0:
+                                log_with_callback(log_cb, f"🔄 Recovered Position from API: {active_symbol} @ {last_buy_price}")
+                        break
+            
+            buy_active = has_open_pos
+            
+            # Update UI Indicator
+            if buy_active:
+                root.after(0, lambda: position_label.config(text="● POSITION OPEN", foreground="#ef4444"))
+            else:
+                root.after(0, lambda: position_label.config(text="● NO POSITION", foreground="#6b7280"))
+        except Exception as pe:
+             log_with_callback(log_cb, f"⚠️ Position Sync Error: {pe}")
+        
+        # 2. ORDER PROCESSING & STATS
         report = client.order_report()
-        if not report or not report.get("data"):
-            return
-
-        engine = PositionPnLEngine()
-        trades = parse_api_orders(report["data"])
-        trades.sort(key=lambda x: x.time)
-
-        for t in trades:
-            engine.add_trade(t)
+        # Handle both list and dict-with-data formats
+        report_data = report.get("data", []) if isinstance(report, dict) else report
         
-        # 0. Enrich completed trades with metadata if needed
-        global last_trade_count, active_trade_metadata
-        if len(engine.completed_trades) > last_trade_count:
-            # We have a NEW completed trade. Tag the most recent one with our metadata.
-            latest = engine.completed_trades[-1]
-            if active_trade_metadata:
-                latest.update(active_trade_metadata)
-                active_trade_metadata = {} # Clear for next trade
-        
-        # 1. Buy Disable Logic (Keep in worker for performance)
-        process_buy_disable_logic(engine)
+        if report_data and isinstance(report_data, list):
+            # Refreshed engine with latest data
+            new_engine = PositionPnLEngine()
+            trades = parse_api_orders(report_data)
+            trades.sort(key=lambda x: x.time)
+            for t in trades:
+                new_engine.add_trade(t)
+            # Enrich completed trades
+            if len(new_engine.completed_trades) > last_trade_count:
+                for i in range(last_trade_count, len(new_engine.completed_trades)):
+                    trade = new_engine.completed_trades[i]
+                    if active_trade_metadata:
+                        # Only clear metadata if it's the right trade or a manual/cleanup scenario
+                        if trade['symbol'] == active_symbol:
+                            trade.update(active_trade_metadata)
+                            active_trade_metadata = {} # Reset ONLY if matched
+                        elif not trade.get('entry_sig'):
+                            trade.update(active_trade_metadata)
+                            active_trade_metadata = {}
+                
+                # Save immediately after enrichment
+                save_trades_to_csv(new_engine.completed_trades)
+                last_trade_count = len(new_engine.completed_trades)
+            
+            pnl_engine = new_engine
+            process_buy_disable_logic(pnl_engine)
 
-        # 2. Calculate Stats
-        completed = engine.completed_trades
+        # 2.1 Calculate Stats using persistent engine
+        completed = pnl_engine.completed_trades
         pnls = [round(t["net_pnl"]) for t in completed]
         wins = sum(1 for p in pnls if p > 0)
         losses = sum(1 for p in pnls if p < 0)
@@ -607,13 +833,15 @@ def update_monitor_ui():
         ]
         
         try:
-            th = engine.trading_hours_summary()
+            th = pnl_engine.trading_hours_summary()
             lines.append(f"Avg/hr    : {th['avg_per_hour']}")
         except: pass
 
         # 3. Handle LTP for Indicators (Use Index instead of Option)
-        tr = tr_symbol.get().strip()
-        idx_symbol, idx_exch = get_underlying_index(tr)
+        tr_current_ui = tr_symbol.get().strip().upper()
+        # Use active_symbol if we have one, otherwise UI symbol
+        tr_for_quote = active_symbol if (buy_active and active_symbol) else tr_current_ui
+        idx_symbol, idx_exch = get_underlying_index(tr_for_quote)
         
         if idx_symbol:
             try:
@@ -631,12 +859,15 @@ def update_monitor_ui():
                 if idx_ltp > 0:
                     scalp_manager.add_ltp(idx_ltp, idx_symbol)
             except Exception as e:
-                log_with_callback(log_cb, f"Index Quote Error: {e}")
-        elif tr:
-            # Fallback to Option LTP if no index mapping
-            token = find_token_for_trading_symbol(tr)
-            if token:
-                exch = detect_exchange_segment(tr)
+                pass
+        
+        # Fallback Indicator Data: If index quote failed OR no index mapping, 
+        # use the Option LTP to keep the manager "Warm" and moving.
+        if not idx_symbol or idx_ltp <= 0:
+            try:
+                token = find_token_for_trading_symbol(tr_current_ui)
+                if token:
+                    exch = detect_exchange_segment(tr_current_ui)
                 quote_resp = client.quotes(instrument_tokens=[{"instrument_token": token, "exchange_segment": exch}], quote_type="ltp")
                 
                 ltp = 0
@@ -648,30 +879,65 @@ def update_monitor_ui():
                         ltp = float(data[0].get("ltp", 0))
                 
                 if ltp > 0:
-                    scalp_manager.add_ltp(ltp, tr)
+                    scalp_manager.add_ltp(ltp, tr_current_ui)
+            except: pass
         
         indicator_data = scalp_manager.get_signal()
         sig = indicator_data['signal']
         
-        if sig in ["BULLISH", "BEARISH"]:
-            trade_status = "Allowed to Trade"
-            trade_color = "green"
+        if sig == "BULLISH":
+            trade_status = "📈 BULLISH SETUP"
+            trade_color = "#10b981" # Emerald Green
+        elif sig == "BEARISH":
+            trade_status = "📉 BEARISH SETUP"
+            trade_color = "#10b981" # Emerald Green
+        elif sig == "SIDEWAYS (PINCHED)":
+            trade_status = "⏸️ MARKET SIDEWAYS"
+            trade_color = "#f97316" # Orange
+        elif sig == "NEUTRAL":
+            trade_status = "⚖️ NEUTRAL / WAITING"
+            trade_color = "#6b7280" # Gray
         elif "WAITING" in sig:
-            trade_status = f"Dont Trade ({sig})"
-            trade_color = "black"
+            # Extract (N pts) info
+            pts_info = sig.split("WAITING")[1] if "WAITING" in sig else ""
+            trade_status = f"⏳ WARMING UP{pts_info}"
+            trade_color = "#6b7280" # Gray
         else:
-            trade_status = "Dont Trade"
-            trade_color = "red"
+            trade_status = f"🔍 {sig}"
+            trade_color = "#ef4444" # Red
 
         # 🎯 AUTOMATIC TARGET EXIT LOGIC
-        if buy_active and last_buy_price > 0:
-            # Check price of the symbols we bought
-            token = find_token_for_trading_symbol(tr)
-            exch = detect_exchange_segment(tr)
-            q = client.quotes(instrument_tokens=[{"instrument_token": token, "exchange_segment": exch}], quote_type="ltp")
+        if buy_active and not exit_pending:
             cur_ltp = 0
-            if isinstance(q, list) and len(q) > 0: cur_ltp = float(q[0].get("ltp", 0))
-            elif isinstance(q, dict): cur_ltp = float(q.get("data", [{}])[0].get("ltp", 0))
+            
+            # 🛡️ RECOVER STATE if buy_active is true but we lost the price/symbol
+            # (Already recovered from API above, this is a safety fallback)
+            if not active_symbol or last_buy_price <= 0:
+                for sym, pos_list in pnl_engine.open_trades.items():
+                    if pos_list:
+                        active_symbol = sym
+                        last_buy_price = pos_list[0]['buy_price']
+                        log_with_callback(log_cb, f"🔄 Recovered Position from Engine: {active_symbol} @ {last_buy_price}")
+                        break
+
+            if last_buy_price <= 0:
+                log_with_callback(log_cb, "⚠️ Warning: Position active but entry price is 0. Exit logic skipped.")
+            else:
+                try:
+                    # Check price of the symbols we bought
+                    tr_to_exit = active_symbol if active_symbol else tr_current_ui
+                    option_token = find_token_for_trading_symbol(tr_to_exit)
+                    option_exch = detect_exchange_segment(tr_to_exit)
+                    
+                    q = client.quotes(instrument_tokens=[{"instrument_token": option_token, "exchange_segment": option_exch}], quote_type="ltp")
+                    if isinstance(q, list) and len(q) > 0: 
+                        cur_ltp = float(q[0].get("ltp", 0))
+                    elif isinstance(q, dict): 
+                        data = q.get("data", [])
+                        if isinstance(data, list) and len(data) > 0:
+                            cur_ltp = float(data[0].get("ltp", 0))
+                except Exception as qe:
+                    log_with_callback(log_cb, f"⚠️ Quote Fetch/Parse Error: {qe}")
             
             if cur_ltp > 0:
                 global max_price_seen
@@ -696,21 +962,61 @@ def update_monitor_ui():
                 lines.append(f"Position: {profit:+.2f} pts")
                 lines.append(f"Tgt: {target:.1f} | SL: {effective_sl_pts:.1f} {'(Trl)' if trail_gain > 0 else ''}")
                 
+                if auto_mode:
+                    print(f"DEBUG: Track Exit | {active_symbol} | LTP: {cur_ltp} | Profit: {profit:+.2f} | Tgt: {target} | SL: {-effective_sl_pts:.2f}")
+
                 if auto_mode and profit >= target:
                     log_with_callback(log_cb, f"🎯 TARGET REACHED ({profit:+.2f} pts). Exiting...")
                     run_bg(do_exit, reason="Target")
+                    return
                 elif auto_mode and profit <= -effective_sl_pts:
                     log_with_callback(log_cb, f"🛑 STOP LOSS HIT ({profit:+.2f} pts). Exiting...")
                     run_bg(do_exit, reason="SL")
+                    return
+                elif auto_mode:
+                    # REFINED EXIT LOGIC:
+                    # 1. ROC Stalls (Negative for BULLISH, Positive for BEARISH)
+                    # 2. BBW Contraction (current < entry)
+                    # 3. Time-Stop (20s)
+                    
+                    e_bbw = active_trade_metadata.get("entry_bbw", 0)
+                    e_ts = active_trade_metadata.get("entry_time_ts", 0)
+                    cur_bbw = indicator_data.get("bb_width", 0)
+                    cur_roc = indicator_data.get("roc", 0)
+                    duration = time.time() - e_ts if e_ts > 0 else 0
+                    
+                    # Determine if we are in a CE or PE trade based on entry signal
+                    entry_sig = active_trade_metadata.get("entry_sig", "")
+                    
+                    exit_needed = False
+                    exit_reason = ""
+                    
+                    if entry_sig == "BULLISH" and cur_roc < -0.005: 
+                        exit_needed = True
+                        exit_reason = "ROC Stall"
+                    elif entry_sig == "BEARISH" and cur_roc > 0.005:
+                        exit_needed = True
+                        exit_reason = "ROC Stall"
+                    elif cur_bbw < e_bbw and e_bbw > 0:
+                        exit_needed = True
+                        exit_reason = "BBW Contraction"
+                    elif duration > 20:
+                        exit_needed = True
+                        exit_reason = "Time-Stop (20s)"
+                    
+                    if exit_needed:
+                        log_with_callback(log_cb, f"🛡️ AUTO EXIT: {exit_reason} detected ({profit:+.2f} pts). Exiting...")
+                        run_bg(do_exit, reason=exit_reason)
+                        return # Stop further processing this tick to avoid double exit
         
         lines.append("-" * 20)
-        lines.append(f"Source: {idx_symbol or tr}")
+        lines.append(f"Source: {idx_symbol or tr_for_quote}")
 
         # Update Scalper UI Strategy Label
         root.after(0, lambda: strategy_status_label.config(text=f"Strategy: {trade_status}", foreground=trade_color))
 
         # 🤖 AUTO MODE LOGIC
-        if auto_mode and not buy_active:
+        if auto_mode and not buy_active and not buy_pending:
             tr = tr_symbol.get().strip().upper()
             is_ce = tr.endswith("CE")
             is_pe = tr.endswith("PE")
@@ -726,11 +1032,23 @@ def update_monitor_ui():
                 elif is_ce: mismatch_msg = "Market is BEARISH, but a CALL (CE) is selected. Skipping..."
 
             if should_buy:
+                # Extra Step 3 Check: Price not more than 5 points above/below EMA
+                ema = indicator_data.get("ema", 0)
+                cur_p = indicator_data.get("ltp", 0)
+                proximity_ok = False
+                if sig == "BULLISH" and cur_p <= (ema + 5): proximity_ok = True
+                elif sig == "BEARISH" and cur_p >= (ema - 5): proximity_ok = True
+                
+                if not proximity_ok:
+                    log_with_callback(log_cb, f"⚠️ AUTO: {sig} signal detected, but price ({cur_p}) is too far from EMA ({ema}). Skipping...")
+                    should_buy = False
+
+            if should_buy:
                 # Check if buy is actually allowed (not disabled)
                 disabled, _, reason = is_buy_disabled()
                 if not disabled:
                     log_with_callback(log_cb, f"🤖 AUTO: {sig} signal matched with {tr}. Placing BUY...")
-                    run_bg(do_buy)
+                    run_bg(do_buy, trade_type="Auto")
                 else:
                     # Log why it didn't trade if disabled
                     pass # Status label already shows this
@@ -739,8 +1057,7 @@ def update_monitor_ui():
                 # We can use a simple state check if needed, but for now log it.
                 log_with_callback(log_cb, f"⚠️ AUTO: {mismatch_msg}")
 
-        # 4. Save to CSV
-        save_trades_to_csv(completed)
+        # 4. Render on Main Thread
 
         # 5. Render on Main Thread
         root.after(0, lambda: render_monitor_display(lines, net, gross))
@@ -840,28 +1157,25 @@ def process_buy_disable_logic(engine):
             log_with_callback(log_cb, f"DEBUG: Re-enable check failed: {e}")
 
 def save_trades_to_csv(completed):
-    global last_trade_count
-    if len(completed) == last_trade_count:
-        return
     try:
         import csv
         os.makedirs("logs", exist_ok=True)
         filename = f"logs/trades_{datetime.now().strftime('%Y-%m-%d')}.csv"
         with open(filename, "w", newline="") as f:
             writer = csv.writer(f)
-            headers = ["Symbol", "Date", "Buy Time", "Sell Time", "Qty", "Buy Price", "Sell Price", "Gross PnL", "Charges", "Net PnL", 
+            headers = ["Symbol", "Trade Type", "Date", "Buy Time", "Sell Time", "Qty", "Buy Price", "Sell Price", "Gross PnL", "Charges", "Net PnL", 
                        "Exit Reason", "E_Sig", "E_EMA", "E_ROC", "E_BBW", "X_Sig", "X_EMA", "X_ROC", "X_BBW"]
             writer.writerow(headers)
             for t in completed:
                 row = [
-                    t["symbol"], t.get("trade_date"), t.get("buy_time"), t.get("sell_time"), t.get("buy_qty"), 
+                    t["symbol"], t.get("trade_type", "Manual"), t.get("trade_date"), t.get("buy_time"), t.get("sell_time"), t.get("buy_qty"), 
                     t.get("buy_price"), t.get("sell_price"), t.get("gross_pnl"), t.get("charges"), t.get("net_pnl"),
                     t.get("exit_reason", "N/A"),
                     t.get("entry_sig", "N/A"), t.get("entry_ema", "N/A"), t.get("entry_roc", "N/A"), t.get("entry_bbw", "N/A"),
                     t.get("exit_sig", "N/A"), t.get("exit_ema", "N/A"), t.get("exit_roc", "N/A"), t.get("exit_bbw", "N/A")
                 ]
                 writer.writerow(row)
-        last_trade_count = len(completed)
+        log_with_callback(log_cb, f"📝 Trades logged to {filename}")
     except Exception as e:
         log_with_callback(log_cb, f"CSV Error: {e}")
 

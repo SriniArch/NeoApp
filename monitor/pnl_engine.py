@@ -113,28 +113,67 @@ def parse_api_orders(api_data: List[dict]) -> List[Trade]:
     trades = []
 
     for o in api_data:
-        if o.get("ordSt") != "complete":
+        raw_status = str(o.get("ordSt", ""))
+        status = raw_status.lower()
+        if status not in ["complete", "completed", "filled"]:
             continue
 
-        avg_price = float(o.get("avgPrc", 0))
+        # Try multiple price keys for BSE/SENSEX compatibility
+        avg_price = float(o.get("avgPrc") or o.get("buyAvgPrc") or o.get("sellAvgPrc") or 0)
+        
+        # Fallback: Calculate from Amount and Qty
+        if avg_price == 0:
+            try:
+                amt = float(o.get("buyAmt") or o.get("sellAmt") or 0)
+                # Use filled qty primarily for price calculation if avgPrc is 0
+                f_qty = float(o.get("flQty") or o.get("flBuyQty") or o.get("flSellQty") or o.get("qty") or 0)
+                if f_qty > 0: avg_price = amt / f_qty
+            except: pass
+
         if avg_price == 0:
             continue
 
-        # Handle timestamp spacing issues safely
-        ts = o["exCfmTm"].replace("  ", " ").replace(": ", ":")
-        trade_time = datetime.strptime(ts, "%d-%b-%Y %H:%M:%S")
+        # Flexible Timestamp Parsing
+        trade_time = datetime.now()
+        # BSE often uses hsUpTm or updRecvTm
+        ts_raw = str(o.get("exCfmTm", "") or o.get("ordTm", "") or o.get("updRecvTm", "") or o.get("hsUpTm", ""))
+        if ts_raw:
+            ts = ' '.join(ts_raw.split())
+            # FIX: Corrected %Y/%m/%d format
+            formats = ["%d-%b-%Y %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"]
+            for fmt in formats:
+                try:
+                    trade_time = datetime.strptime(ts, fmt)
+                    break
+                except: continue
 
-        trades.append(
-            Trade(
-                symbol=o["trdSym"],
-                side=o["trnsTp"],
-                qty=int(o["qty"]),
-                price=avg_price,
-                time=trade_time,
-                product=o["prod"],
-                segment=o["exSeg"]
-            )
+        # Normalize side to B / S
+        side = str(o.get("trnsTp", "")).upper()
+        if "BUY" in side or side == "B": side = "B"
+        elif "SELL" in side or side == "S": side = "S"
+        else: side = side[0] if side else "B" # Fallback to first char
+
+        # Quantity: Prefer filled quantity (flQty) for completed trades
+        q_val = o.get("flQty") or o.get("qty") or o.get("flBuyQty") or o.get("flSellQty") or 0
+        try:
+            qty = int(float(str(q_val)))
+        except:
+            qty = 0
+
+        if qty == 0:
+            continue
+
+        trade = Trade(
+            symbol=str(o.get("trdSym", "")).strip().upper(),
+            side=side,
+            qty=qty,
+            price=avg_price,
+            time=trade_time,
+            product=str(o.get("prod", "MIS")),
+            segment=str(o.get("exSeg", ""))
         )
+        trades.append(trade)
+        print(f"DEBUG: Parsed Trade - {trade.side} {trade.qty} {trade.symbol} @ {trade.price} ({trade.time})")
     return trades
 
 
@@ -145,7 +184,7 @@ class PositionPnLEngine:
         self.completed_trades = []
 
     def add_trade(self, trade: Trade):
-        symbol = trade.symbol
+        symbol = trade.symbol.strip().upper()
 
         # BUY opens or adds to a position (per symbol)
         if trade.side == "B":
@@ -185,6 +224,7 @@ class PositionPnLEngine:
 
                     self.completed_trades.append(pos)
                     self.open_trades[symbol].popleft()
+                    print(f"DEBUG: Trade Completed - {symbol} PnL: {pos['net_pnl']}")
             
             if not self.open_trades[symbol]:
                 del self.open_trades[symbol]

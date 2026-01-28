@@ -80,6 +80,7 @@ class LiveScalpingManager:
         """Append new LTP, maintain history size and save."""
         now = datetime.now()
         today_str = now.strftime("%Y-%m-%d")
+        symbol = str(symbol).strip().upper()
         
         # Check if we need to switch files (Symbol change or Date change)
         if symbol != self.current_symbol or today_str != self.current_date:
@@ -105,52 +106,58 @@ class LiveScalpingManager:
     def get_signal(self) -> dict:
         """
         Calculate indicators on current history and return signal + values.
-        Using the new strategy: 9-Tick EMA, ROC, BB Width, and 2nd Tick Sequence.
+        Using the refined strategy: EMA, ROC (rising), BB Width > 3.0.
         """
         if len(self.history) < 20:
             needed = 20 - len(self.history)
-            return {"signal": f"WAITING ({needed} pts)", "ema": 0, "roc": 0, "bb_width": 0}
+            return {"signal": f"WAITING ({needed} pts)", "ema": 0, "roc": 0, "bb_width": 0, "roc_rising": False}
 
         prices = self.history['ltp'].astype(float)
         
-        # 1. EMA (9) - Micro trend
-        ema = ScalpingIndicator.calculate_ema(prices, 9).iloc[-1]
+        # 1. EMA (9)
+        ema_series = ScalpingIndicator.calculate_ema(prices, 9)
+        ema = ema_series.iloc[-1]
         
-        # 2. Price Velocity (ROC 12)
-        roc = ScalpingIndicator.calculate_roc(prices, 12).iloc[-1]
+        # 2. ROC (12)
+        roc_series = ScalpingIndicator.calculate_roc(prices, 12)
+        roc = roc_series.iloc[-1]
         
-        # 3. BB Width (20, 2) - Filter sideways trap
-        bb_width = ScalpingIndicator.calculate_bb_width(prices, 20, 2).iloc[-1]
+        # Check if ROC is rising over last 3 ticks
+        roc_rising = False
+        if len(roc_series) >= 3:
+            r1, r2, r3 = roc_series.iloc[-3:]
+            roc_rising = (r3 > r2 > r1)
         
-        # 4. 2-Tick Sequence confirmation
-        # Check direction of last 3 ticks (now, prev, prev2)
+        # 3. BB Width (20, 2)
+        bb_width_series = ScalpingIndicator.calculate_bb_width(prices, 20, 2)
+        bb_width = bb_width_series.iloc[-1]
+        
+        # 4. Sequence
         p_now = prices.iloc[-1]
         p_prev = prices.iloc[-2]
         p_prev2 = prices.iloc[-3]
-        
         up_seq = (p_now > p_prev > p_prev2)
         down_seq = (p_now < p_prev < p_prev2)
         
-        # Logic thresholds
-        # BB Width threshold: If width is too low (e.g., < 0.05% of price), it's sideways
-        # We use a relative threshold (0.02% of current price as a base volatility filter)
-        vol_threshold = p_now * 0.0002 
-        is_volatile = bb_width > vol_threshold
+        # Strategy Logic: BBW > 3.0 ensuring market isn't "pinched"
+        is_volatile = bb_width > 3.0
 
         signal = "NEUTRAL"
         if is_volatile:
-            if p_now > ema and roc > 0 and up_seq:
+            if p_now > ema and roc > 0 and roc_rising and up_seq:
                 signal = "BULLISH"
-            elif p_now < ema and roc < 0 and down_seq:
+            elif p_now < ema and roc < 0 and not roc_rising and down_seq: # Falling ROC for bearish
                 signal = "BEARISH"
         else:
-            signal = "SIDEWAYS (TRAP)"
+            signal = "SIDEWAYS (PINCHED)"
         
         return {
             "signal": signal,
             "ema": round(ema, 2),
             "roc": round(roc, 4),
+            "roc_rising": roc_rising,
             "bb_width": round(bb_width, 2),
+            "ltp": p_now,
             "trend": "UP" if up_seq else "DOWN" if down_seq else "FLAT"
         }
 
@@ -175,6 +182,6 @@ class LiveScalpingManager:
     def reset(self):
         """Clear history."""
         self.history = pd.DataFrame(columns=['timestamp', 'ltp', 'symbol'])
-        if os.path.exists(self.storage_file):
+        if self.storage_file and os.path.exists(self.storage_file):
             try: os.remove(self.storage_file)
             except: pass
