@@ -15,6 +15,7 @@ class Trade:
     time: datetime
     product: str       # MIS / NRML
     segment: str       # nse_cm / nse_fo / bse_fo
+    order_id: str = ""
 
 
 # =========================
@@ -170,10 +171,11 @@ def parse_api_orders(api_data: List[dict]) -> List[Trade]:
             price=avg_price,
             time=trade_time,
             product=str(o.get("prod", "MIS")),
-            segment=str(o.get("exSeg", ""))
+            segment=str(o.get("exSeg", "")),
+            order_id=str(o.get("nOrdNo", ""))
         )
         trades.append(trade)
-        print(f"DEBUG: Parsed Trade - {trade.side} {trade.qty} {trade.symbol} @ {trade.price} ({trade.time})")
+        #print(f"DEBUG: Parsed Trade - {trade.side} {trade.qty} {trade.symbol} @ {trade.price} ({trade.time})")
     return trades
 
 
@@ -194,6 +196,7 @@ class PositionPnLEngine:
                 "buy_qty": trade.qty,
                 "open_qty": trade.qty,
                 "buy_time": trade.time,
+                "buy_order_id": trade.order_id,
                 "gross_pnl": 0.0,
                 "charges": 0.0
             })
@@ -220,11 +223,12 @@ class PositionPnLEngine:
                     pos["net_pnl"] = round(pos["gross_pnl"] - pos["charges"], 2)
                     pos["sell_price"] = trade.price
                     pos["sell_time"] = trade.time
+                    pos["sell_order_id"] = trade.order_id
                     pos["trade_date"] = trade.time.date()
 
                     self.completed_trades.append(pos)
                     self.open_trades[symbol].popleft()
-                    print(f"DEBUG: Trade Completed - {symbol} PnL: {pos['net_pnl']}")
+                    #print(f"DEBUG: Trade Completed - {symbol} PnL: {pos['net_pnl']} [B:{pos['buy_order_id']} S:{pos['sell_order_id']}]")
             
             if not self.open_trades[symbol]:
                 del self.open_trades[symbol]

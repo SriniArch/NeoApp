@@ -37,3 +37,35 @@ def find_trading_symbol_raw(symbol: str, expiry: str, strike: int, option_type: 
     month = expiry[3:6].upper()
     year = expiry[-2:]
     return f"{symbol.upper()}{day}{month}{strike}{option_type.upper()}"
+def fetch_remote_config(url: str, default_val: int) -> int:
+    """Fetch a single integer value from a remote URL (raw text)."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            content = response.read().decode('utf-8').strip()
+            return int(float(content))
+    except Exception as e:
+        print(f"Warning: Failed to fetch remote config from {url}: {e}")
+        return default_val
+
+def fetch_remote_json(url: str, default_val: any) -> any:
+    """Fetch and parse JSON from a remote URL."""
+    import urllib.request
+    import json
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            content = response.read().decode('utf-8').strip()
+            return json.loads(content)
+    except Exception as e:
+        # Silently fail or minimal log for background fetches
+        return default_val
+def get_resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    import os, sys
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    return os.path.join(base_path, relative_path)

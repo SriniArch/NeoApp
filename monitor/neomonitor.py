@@ -12,7 +12,8 @@ import pandas as pd
 from monitor.pnl_engine import PositionPnLEngine, parse_api_orders
 import json
 import time
-from common.config import ENABLE_BUY_DISABLE, BUY_DISABLE_DURATION, BUY_DISABLE_LOSS_COUNT, ENABLE_LTP_LOGGER
+from common.config import ENABLE_BUY_DISABLE, BUY_DISABLE_DURATION, BUY_DISABLE_LOSS_COUNT, ENABLE_LTP_LOGGER, PROGRESSIVE_LOSS_CONFIG, BUY_DISABLE_MAX_PROFIT, PROGRESSIVE_LOSS_URL, REMOTE_CONFIG_URL
+from common.utils import fetch_remote_config, fetch_remote_json
 
 BUY_DISABLED_FILE = "buy_disabled.json"
 buy_disabled = False
@@ -96,6 +97,24 @@ while True:
     trades = parse_api_orders(response["data"])
     trades.sort(key=lambda x: x.time)
 
+    # Periodic Config Refresh (Every 5 mins)
+    if not hasattr(engine, "last_config_refresh"):
+        # We need a persistent way to track this in the script
+        pass # Better to use a global or a local var outside the loop
+
+    # Reset every few iterations or use time
+    if 'last_config_refresh' not in globals():
+        global last_config_refresh
+        last_config_refresh = 0
+    
+    if time.time() - last_config_refresh > 300:
+        global PROGRESSIVE_LOSS_CONFIG
+        new_prog = fetch_remote_json(PROGRESSIVE_LOSS_URL, PROGRESSIVE_LOSS_CONFIG)
+        if new_prog != PROGRESSIVE_LOSS_CONFIG:
+            PROGRESSIVE_LOSS_CONFIG = new_prog
+            print("🔄 Progressive Loss Config updated from remote.")
+        last_config_refresh = time.time()
+
     for t in trades:
         engine.add_trade(t)
 
@@ -110,30 +129,43 @@ while True:
         except:
             pass
 
-    if ENABLE_BUY_DISABLE and len(engine.completed_trades) >= BUY_DISABLE_LOSS_COUNT:
-        last_n = engine.completed_trades[-BUY_DISABLE_LOSS_COUNT:]
-        last_trade_time = last_n[-1].get("sell_time") or last_n[-1].get("buy_time")
-        last_trade_ts = None
-        if last_trade_time:
-            if hasattr(last_trade_time, 'timestamp'):
-                last_trade_ts = last_trade_time.timestamp()
-            else:
-                try:
-                    last_trade_ts = datetime.fromisoformat(str(last_trade_time)).timestamp()
-                except:
-                    last_trade_ts = None
-        last_disabled_ts = None
-        if last_disabled_trade_id:
-            try:
-                last_disabled_ts = float(last_disabled_trade_id)
-            except:
-                last_disabled_ts = None
-        if all(t["net_pnl"] < 0 for t in last_n) and last_trade_ts and (not last_disabled_ts or last_trade_ts > last_disabled_ts):
-            disabled_until = time.time() + BUY_DISABLE_DURATION
-            with open(BUY_DISABLED_FILE, 'w') as f:
-                json.dump({"disabled_until": disabled_until, "last_trade_id": str(last_trade_ts)}, f)
-            buy_disabled = True
-            print(f"Buy disabled for {BUY_DISABLE_DURATION // 60} minutes due to {BUY_DISABLE_LOSS_COUNT} continuous losses.")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if ENABLE_BUY_DISABLE:
+        # 1. Progressive Loss Check
+        net_pnl = sum(t["net_pnl"] for t in engine.completed_trades)
+        loss_amount = -net_pnl
+        for threshold, duration_mins in PROGRESSIVE_LOSS_CONFIG:
+            if loss_amount >= threshold:
+                label = f"max_loss_{threshold}"
+                if last_disabled_trade_id != label:
+                    disabled_until = time.time() + (duration_mins * 60)
+                    with open(BUY_DISABLED_FILE, 'w') as f:
+                        json.dump({"disabled_until": disabled_until, "last_trade_id": label, "date": today_str}, f)
+                    duration_str = f"{duration_mins} mins" if duration_mins < 1440 else "tomorrow"
+                    print(f"WARNING: Net Loss {net_pnl} hit threshold {threshold}. Buy disabled for {duration_str}.")
+                break # Only highest
+
+        # 2. Max Profit Check
+        if net_pnl >= BUY_DISABLE_MAX_PROFIT:
+             if last_disabled_trade_id != "max_profit":
+                disabled_until = time.time() + 86400
+                with open(BUY_DISABLED_FILE, 'w') as f:
+                    json.dump({"disabled_until": disabled_until, "last_trade_id": "max_profit", "date": today_str}, f)
+                print(f"SUCCESS: Net Profit {net_pnl} hit target {BUY_DISABLE_MAX_PROFIT}. Buy disabled until tomorrow.")
+
+        # 3. Consecutive Loss Check
+        if len(engine.completed_trades) >= BUY_DISABLE_LOSS_COUNT:
+            last_n = engine.completed_trades[-BUY_DISABLE_LOSS_COUNT:]
+            last_trade_time = last_n[-1].get("sell_time") or last_n[-1].get("buy_time")
+            last_trade_ts = None
+            if last_trade_time:
+                last_trade_ts = str(last_trade_time.timestamp()) if hasattr(last_trade_time, 'timestamp') else str(last_trade_time)
+            
+            if all(t["net_pnl"] < 0 for t in last_n) and last_trade_ts != last_disabled_trade_id:
+                disabled_until = time.time() + BUY_DISABLE_DURATION
+                with open(BUY_DISABLED_FILE, 'w') as f:
+                    json.dump({"disabled_until": disabled_until, "last_trade_id": last_trade_ts, "date": today_str}, f)
+                print(f"Buy disabled for {BUY_DISABLE_DURATION // 60} minutes due to {BUY_DISABLE_LOSS_COUNT} continuous losses.")
 
     # Check if time to re-enable
     if os.path.exists(BUY_DISABLED_FILE):

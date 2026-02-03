@@ -25,8 +25,12 @@ def detect_exchange_segment(trading_symbol: str) -> str:
     return "nse_fo"
 
 def detect_strike_step(trading_symbol: str) -> int:
-    seg = detect_exchange_segment(trading_symbol)
-    return 50 if seg == "nse_fo" else 100
+    s = trading_symbol.upper()
+    if "SENSEX" in s or "BANKEX" in s:
+        return 100
+    if "BANKNIFTY" in s:
+        return 100
+    return 50 # Nifty, Finnifty, Midcap
 
 def place_market_order(token, lots, side, trading_symbol, log_cb=None):
     client = ensure_login(log_cb)

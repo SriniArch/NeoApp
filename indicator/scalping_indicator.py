@@ -106,10 +106,11 @@ class LiveScalpingManager:
     def get_signal(self) -> dict:
         """
         Calculate indicators on current history and return signal + values.
-        Using the refined strategy: EMA, ROC (rising), BB Width > 3.0.
+        Enhanced strategy: EMA, ROC (rising, 30-period), BB Width > 15.0, 7-tick sequence.
         """
-        if len(self.history) < 20:
-            needed = 20 - len(self.history)
+        # Need at least 30 data points for ROC(30)
+        if len(self.history) < 30:
+            needed = 30 - len(self.history)
             return {"signal": f"WAITING ({needed} pts)", "ema": 0, "roc": 0, "bb_width": 0, "roc_rising": False}
 
         prices = self.history['ltp'].astype(float)
@@ -118,38 +119,44 @@ class LiveScalpingManager:
         ema_series = ScalpingIndicator.calculate_ema(prices, 9)
         ema = ema_series.iloc[-1]
         
-        # 2. ROC (12)
-        roc_series = ScalpingIndicator.calculate_roc(prices, 12)
+        # 2. ROC (30) - Extended period for smoother trend detection
+        roc_series = ScalpingIndicator.calculate_roc(prices, 30)
         roc = roc_series.iloc[-1]
         
-        # Check if ROC is rising over last 3 ticks
+        # Check if ROC is trending up over last 3 ticks (relaxed from 5 strict)
         roc_rising = False
         if len(roc_series) >= 3:
-            r1, r2, r3 = roc_series.iloc[-3:]
-            roc_rising = (r3 > r2 > r1)
+            r_vals = roc_series.iloc[-3:].tolist()
+            roc_rising = r_vals[-1] > r_vals[0] and r_vals[-1] > 0
         
         # 3. BB Width (20, 2)
         bb_width_series = ScalpingIndicator.calculate_bb_width(prices, 20, 2)
         bb_width = bb_width_series.iloc[-1]
         
-        # 4. Sequence
-        p_now = prices.iloc[-1]
-        p_prev = prices.iloc[-2]
-        p_prev2 = prices.iloc[-3]
-        up_seq = (p_now > p_prev > p_prev2)
-        down_seq = (p_now < p_prev < p_prev2)
+        # 4. Sequence - Relaxed to 4 ticks and allows equality as long as net gain
+        if len(prices) >= 4:
+            last_4 = prices.iloc[-4:].tolist()
+            up_seq = all(last_4[i] <= last_4[i+1] for i in range(len(last_4)-1)) and last_4[-1] > last_4[0]
+            down_seq = all(last_4[i] >= last_4[i+1] for i in range(len(last_4)-1)) and last_4[-1] < last_4[0]
+        else:
+            up_seq = False
+            down_seq = False
         
-        # Strategy Logic: BBW > 3.0 ensuring market isn't "pinched"
-        is_volatile = bb_width > 3.0
+        # Strategy Logic: BBW > 10.0 (Relaxed from 15.0), ROC exhaustion filter
+        is_volatile = bb_width > 10.0
+        roc_exhausted = abs(roc) > 10.0  # Avoid buying at spike peaks
 
+        p_now = prices.iloc[-1]
         signal = "NEUTRAL"
-        if is_volatile:
+        if is_volatile and not roc_exhausted:
             if p_now > ema and roc > 0 and roc_rising and up_seq:
                 signal = "BULLISH"
             elif p_now < ema and roc < 0 and not roc_rising and down_seq: # Falling ROC for bearish
                 signal = "BEARISH"
+        elif roc_exhausted:
+            signal = "EXHAUSTED (ROC TOO HIGH)"
         else:
-            signal = "SIDEWAYS (PINCHED)"
+            signal = f"SIDEWAYS (BBW {round(bb_width, 1)} < 10.0)"
         
         return {
             "signal": signal,

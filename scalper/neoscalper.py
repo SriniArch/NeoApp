@@ -10,10 +10,10 @@ import os
 # Allow importing from parent directory
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from common.utils import log_with_callback, run_bg
+from common.config import DEFAULT_TRADING_SYMBOL, BUY_DISABLE_DURATION, BUY_DISABLE_LOSS_COUNT, BUY_DISABLE_MAX_LOSS, BUY_DISABLE_MAX_PROFIT, PROGRESSIVE_LOSS_CONFIG, PROGRESSIVE_LOSS_CONFIG_DEFAULT, REFRESH_INTERVAL_MS, DEFAULT_TARGET, DEFAULT_SL, DEFAULT_TSL_STEP, COOL_OFF_PERIOD, REMOTE_CONFIG_URL, PROGRESSIVE_LOSS_URL
+from common.utils import log_with_callback, run_bg, fetch_remote_config, fetch_remote_json, get_resource_path
 from common.scrip_master import load_scrip_master_csv, find_token_for_trading_symbol
 from common.orders import ensure_login as do_login, place_market_order, get_client, detect_exchange_segment, detect_strike_step
-from common.config import DEFAULT_TRADING_SYMBOL, ENABLE_BUY_DISABLE, BUY_DISABLE_DURATION, BUY_DISABLE_LOSS_COUNT, BUY_DISABLE_MAX_LOSS, BUY_DISABLE_MAX_PROFIT, RESET_OVERRIDE_DURATION, REFRESH_INTERVAL_MS, DEFAULT_TARGET, DEFAULT_SL, DEFAULT_TSL_STEP, COOL_OFF_PERIOD
 from indicator.scalping_indicator import LiveScalpingManager
 from monitor.pnl_engine import PositionPnLEngine, parse_api_orders
 import json
@@ -38,7 +38,6 @@ buy_disabled = False  # Track if buy is disabled due to losses
 last_trade_count = 0 # Track saved trades
 last_display_content = "" # Cache last displayed content to prevent flickering
 scalp_manager = LiveScalpingManager()
-override_until = 0  # Grace period for manual override (RESET_OVERRIDE_DURATION)
 auto_mode = False   # Automated trading status
 last_buy_price = 0.0 # Entry price of current active position
 max_price_seen = 0.0 # Peak price for trailing SL tracking
@@ -56,7 +55,7 @@ root.title("SCALPER & MONITOR PRO")
 root.geometry("850x340")
 root.resizable(True, True)
 root.configure(bg="#f5f5f5")
-icon = tk.PhotoImage(file="assets/scalper2.png")
+icon = tk.PhotoImage(file=get_resource_path("assets/scalper2.png"))
 root.iconphoto(True, icon)
 
 # ---------------------------------------------------------
@@ -129,19 +128,52 @@ def log_cb(msg):
 # ---------------------------------------------------------
 
 def get_underlying_index(symbol: str):
-    """Maps trading symbol to its underlying index and exchange."""
+    """Maps trading symbol to its underlying index and exchange. Returns (token, exch, nickname)"""
     s = symbol.upper()
     if "NIFTY" in s:
         if "BANK" in s:
-            return "99926009", "nse_cm" # Nifty Bank
+            return "Nifty Bank", "nse_cm", "BANKNIFTY"
         elif "FIN" in s:
-            return "99926037", "nse_cm" # FINNIFTY
-        return "99926000", "nse_cm" # Nifty 50
+            return "Nifty Fin Services", "nse_cm", "FINNIFTY"
+        return "Nifty 50", "nse_cm", "NIFTY_50"
     elif "SENSEX" in s or "BSX" in s:
-        return "1", "bse_cm" # SENSEX
+        return "SENSEX", "bse_cm", "SENSEX"
     elif "BANKEX" in s:
-        return "12", "bse_cm" # BANKEX
-    return None, None
+        return "BSE100", "bse_cm", "BANKEX"
+    return None, None, None
+
+def update_auto_strike(idx_ltp: float, idx_name: str):
+    """Calculates ATM strike, applies offset, and updates UI symbol."""
+    if not auto_strike_var.get() or buy_active: 
+        return # Skip if manual mode or in a trade
+        
+    cur_sym = tr_symbol.get().strip().upper()
+    if not cur_sym: return
+    
+    # 1. Detect Strike Step
+    strike_step = detect_strike_step(cur_sym)
+        
+    # 2. Calculate ATM
+    atm = round(idx_ltp / strike_step) * strike_step
+    
+    # 3. Apply Offset
+    offset_str = strike_offset_var.get() # e.g. "ATM-1", "ATM", "ATM+1"
+    offset_val = 0
+    if "+" in offset_str:
+        offset_val = int(offset_str.split("+")[1])
+    elif "-" in offset_str:
+        offset_val = -int(offset_str.split("-")[1])
+        
+    final_strike = int(atm + (offset_val * strike_step))
+    
+    # 4. Check if we actually need to change it
+    m = re.search(r"(\d+)(CE|PE)?$", cur_sym)
+    if m:
+        cur_strike = int(m.group(1))
+        if cur_strike != final_strike:
+            new_symbol = update_symbol_strike(cur_sym, final_strike)
+            tr_symbol.set(new_symbol)
+            log_with_callback(log_cb, f"⚡ Auto-Strike: {idx_name} @ {idx_ltp} -> {final_strike}")
 
 def update_symbol_strike(symbol: str, new_strike: int) -> str:
     s = symbol.strip().upper()
@@ -207,9 +239,16 @@ def move_strike(step):
     log_with_callback(log_cb, f"Updated Strike: {new_strike}")
 
 updown = ttk.Frame(frm)
-updown.grid(row=0, column=1, columnspan=3, sticky="w", pady=5)
-ttk.Button(updown, text="▲", width=6, command=lambda: move_strike(1)).pack(side="left", padx=2)
-ttk.Button(updown, text="▼", width=6, command=lambda: move_strike(-1)).pack(side="left", padx=2)
+updown.grid(row=0, column=1, columnspan=5, sticky="w", pady=5)
+ttk.Button(updown, text="▲", width=3, command=lambda: move_strike(1)).pack(side="left", padx=1)
+ttk.Button(updown, text="▼", width=3, command=lambda: move_strike(-1)).pack(side="left", padx=1)
+
+auto_strike_var = tk.BooleanVar(value=False)
+ttk.Checkbutton(updown, text="Auto", variable=auto_strike_var).pack(side="left", padx=(10, 2))
+
+strike_offset_var = tk.StringVar(value="ATM")
+offset_combo = ttk.Combobox(updown, textvariable=strike_offset_var, values=["ATM-3", "ATM-2", "ATM-1", "ATM", "ATM+1", "ATM+2", "ATM+3"], width=6, state="readonly")
+offset_combo.pack(side="left", padx=2)
 
 # 2️⃣ OPTION TYPE (Row 1)
 ttk.Label(frm, text="Option:").grid(row=1, column=0, sticky="e", pady=5, padx=5)
@@ -300,11 +339,7 @@ strategy_status_label.pack(side="right", padx=(0, 5))
 
 
 def is_buy_disabled():
-    if override_until > time.time():
-        return False, 0, "override"
 
-    if not ENABLE_BUY_DISABLE:
-        return False, 0, None
     if os.path.exists(BUY_DISABLED_FILE):
         try:
             with open(BUY_DISABLED_FILE, 'r') as f:
@@ -325,15 +360,28 @@ def is_buy_disabled():
 
 def trigger_override():
     global override_until
-    override_until = time.time() + RESET_OVERRIDE_DURATION
+    
+    # Check if strict max-loss lockout is active
+    if os.path.exists(BUY_DISABLED_FILE):
+        try:
+            with open(BUY_DISABLED_FILE, 'r') as f:
+                data = json.load(f)
+            reason = data.get("last_trade_id")
+            if reason == "max_loss" or reason == "max_loss_2000":
+                today = datetime.now().strftime("%Y-%m-%d")
+                if data.get("date") == today:
+                    log_with_callback(log_cb, "⛔ HARD STOP: Max Loss limit reached. Cannot override until tomorrow.")
+                    messagebox.showerror("Hard Stop", "Max Loss limit reached. Trading is disabled for the rest of the day.")
+                    return
+        except: pass
+
     if os.path.exists(BUY_DISABLED_FILE):
         try:
             os.remove(BUY_DISABLED_FILE)
-            log_with_callback(log_cb, "✅ Manual Override: Persistent lockout cleared.")
+            log_with_callback(log_cb, "✅ Manual RESET: Persistent lockout cleared.")
         except: pass
     else:
-        mins = RESET_OVERRIDE_DURATION // 60
-        log_with_callback(log_cb, f"✅ Manual Override: Buy enabled for {mins} minutes.")
+        log_with_callback(log_cb, "✅ Manual RESET: Buy enabled (Conditions will be re-checked).")
     update_status_label()
 
 def toggle_auto_mode():
@@ -348,24 +396,17 @@ def toggle_auto_mode():
 
 
 def update_status_label():
-    if not ENABLE_BUY_DISABLE:
-        status_label.config(text="Buy Disable Feature Disabled", foreground="black")
-        if not buy_active:
-            buy_btn.config(state="normal")
-        root.after(1000, update_status_label)
-        return
     
     disabled, remaining, reason = is_buy_disabled()
-    if reason == "override":
-        rem_override = int(override_until - time.time())
-        mins = rem_override // 60
-        secs = rem_override % 60
-        status_label.config(text=f"Override Active: {mins}:{secs:02d} remaining", foreground="#2563eb")
-        buy_btn.config(state="normal")
-    elif disabled:
+    if disabled:
         buy_btn.config(state="disabled")
-        if reason == "max_loss":
-            status_label.config(text="Buy Disabled - Max Loss Exceeded", foreground="red")
+        if reason.startswith("max_loss"):
+            if reason == "max_loss_2000" or reason == "max_loss":
+                status_label.config(text="Buy Disabled - Max Loss (Hard Stop)", foreground="red")
+            else:
+                mins = int(remaining // 60)
+                secs = int(remaining % 60)
+                status_label.config(text=f"Buy Disabled - Loss Limit ({mins}:{secs:02d})", foreground="red")
         elif reason == "max_profit":
             status_label.config(text="Buy Disabled - Max Profit Reached", foreground="green")
         else:
@@ -388,11 +429,17 @@ def update_status_label():
 
 def do_buy(trade_type="Manual"):
     global buy_active, buy_pending, active_symbol, last_buy_price, max_price_seen, active_trade_metadata, last_exit_time
+    active_trade_metadata = {} # Reset at start to avoid stale data from previous trades
 
     disabled, remaining, reason = is_buy_disabled()
     if disabled:
-        if reason == "max_loss":
-            msg = f"Buy disabled. Net loss has exceeded the limit of {BUY_DISABLE_MAX_LOSS}."
+        if reason.startswith("max_loss"):
+            if reason == "max_loss_2000" or reason == "max_loss":
+                msg = f"Buy disabled. Net loss has reached the hard stop limit of {BUY_DISABLE_MAX_LOSS}."
+            else:
+                mins = int(remaining // 60)
+                secs = int(remaining % 60)
+                msg = f"Buy disabled due to loss reaching a progressive threshold. Re-enables in {mins} minutes {secs} seconds."
         elif reason == "max_profit":
             msg = f"Buy disabled. Net profit has exceeded the limit of {BUY_DISABLE_MAX_PROFIT}."
         else:
@@ -581,6 +628,7 @@ def do_buy(trade_type="Manual"):
     try:
         ind = scalp_manager.get_signal()
         active_trade_metadata = {
+            "symbol": active_symbol, # Track which symbol this metadata belongs to
             "trade_type": trade_type,
             "entry_sig": ind.get("signal"),
             "entry_ema": ind.get("ema"),
@@ -793,16 +841,18 @@ def update_monitor_ui():
                 for i in range(last_trade_count, len(new_engine.completed_trades)):
                     trade = new_engine.completed_trades[i]
                     if active_trade_metadata:
-                        # Only clear metadata if it's the right trade or a manual/cleanup scenario
-                        if trade['symbol'] == active_symbol:
+                        # Only clear/apply metadata if it belongs to THIS symbol
+                        if trade['symbol'] == active_trade_metadata.get("symbol"):
                             trade.update(active_trade_metadata)
-                            active_trade_metadata = {} # Reset ONLY if matched
-                        elif not trade.get('entry_sig'):
+                            active_trade_metadata = {} 
+                        elif not trade.get('entry_sig') and not active_symbol:
+                            # Fallback cleanup only if no new trade is active
                             trade.update(active_trade_metadata)
                             active_trade_metadata = {}
                 
-                # Save immediately after enrichment
-                save_trades_to_csv(new_engine.completed_trades)
+                # Save ONLY the new trades to CSV (Appended)
+                new_trades = new_engine.completed_trades[last_trade_count:]
+                save_trades_to_csv(new_trades)
                 last_trade_count = len(new_engine.completed_trades)
             
             pnl_engine = new_engine
@@ -841,29 +891,36 @@ def update_monitor_ui():
         tr_current_ui = tr_symbol.get().strip().upper()
         # Use active_symbol if we have one, otherwise UI symbol
         tr_for_quote = active_symbol if (buy_active and active_symbol) else tr_current_ui
-        idx_symbol, idx_exch = get_underlying_index(tr_for_quote)
+        idx_token, idx_exch, idx_name = get_underlying_index(tr_for_quote)
         
-        if idx_symbol:
+        idx_ltp = 0
+        if idx_token:
             try:
                 # Fetch Index LTP
-                quote_resp = client.quotes(instrument_tokens=[{"instrument_token": idx_symbol, "exchange_segment": idx_exch}], quote_type="ltp")
+                quote_resp = client.quotes(instrument_tokens=[{"instrument_token": idx_token, "exchange_segment": idx_exch}], quote_type="ltp")
                 
-                idx_ltp = 0
                 if isinstance(quote_resp, list) and len(quote_resp) > 0:
                     idx_ltp = float(quote_resp[0].get("ltp", 0))
                 elif isinstance(quote_resp, dict):
+                    # Handle both {'data': [...]} and direct dict formats
                     data = quote_resp.get("data", [])
                     if isinstance(data, list) and len(data) > 0:
                         idx_ltp = float(data[0].get("ltp", 0))
+                    elif "ltp" in quote_resp:
+                        idx_ltp = float(quote_resp.get("ltp", 0))
                 
                 if idx_ltp > 0:
-                    scalp_manager.add_ltp(idx_ltp, idx_symbol)
+                    scalp_manager.add_ltp(idx_ltp, idx_name)
+                    # 🚀 AUTO STRIKE SELECTION
+                    update_auto_strike(idx_ltp, idx_name)
+                else:
+                    log_with_callback(log_cb, f"⚠️ Warning: Index fetch for {idx_name} returned 0. Using fallback.")
             except Exception as e:
-                pass
+                log_with_callback(log_cb, f"⚠️ Index Quote Error ({idx_name}): {e}")
         
         # Fallback Indicator Data: If index quote failed OR no index mapping, 
         # use the Option LTP to keep the manager "Warm" and moving.
-        if not idx_symbol or idx_ltp <= 0:
+        if not idx_token or idx_ltp <= 0:
             try:
                 token = find_token_for_trading_symbol(tr_current_ui)
                 if token:
@@ -973,7 +1030,7 @@ def update_monitor_ui():
                     log_with_callback(log_cb, f"🛑 STOP LOSS HIT ({profit:+.2f} pts). Exiting...")
                     run_bg(do_exit, reason="SL")
                     return
-                elif auto_mode:
+                elif auto_mode and active_trade_metadata.get("symbol") == active_symbol:
                     # REFINED EXIT LOGIC:
                     # 1. ROC Stalls (Negative for BULLISH, Positive for BEARISH)
                     # 2. BBW Contraction (current < entry)
@@ -984,7 +1041,7 @@ def update_monitor_ui():
                     cur_bbw = indicator_data.get("bb_width", 0)
                     cur_roc = indicator_data.get("roc", 0)
                     duration = time.time() - e_ts if e_ts > 0 else 0
-                    
+
                     # Determine if we are in a CE or PE trade based on entry signal
                     entry_sig = active_trade_metadata.get("entry_sig", "")
                     
@@ -997,7 +1054,7 @@ def update_monitor_ui():
                     elif entry_sig == "BEARISH" and cur_roc > 0.005:
                         exit_needed = True
                         exit_reason = "ROC Stall"
-                    elif cur_bbw < e_bbw and e_bbw > 0:
+                    elif cur_bbw < (e_bbw * 0.90) and e_bbw > 0:
                         exit_needed = True
                         exit_reason = "BBW Contraction"
                     elif duration > 20:
@@ -1010,7 +1067,7 @@ def update_monitor_ui():
                         return # Stop further processing this tick to avoid double exit
         
         lines.append("-" * 20)
-        lines.append(f"Source: {idx_symbol or tr_for_quote}")
+        lines.append(f"Source: {idx_name or tr_for_quote}")
 
         # Update Scalper UI Strategy Label
         root.after(0, lambda: strategy_status_label.config(text=f"Strategy: {trade_status}", foreground=trade_color))
@@ -1067,10 +1124,29 @@ def update_monitor_ui():
     finally:
         # Schedule next update correctly
         root.after(REFRESH_INTERVAL_MS, lambda: run_bg(update_monitor_ui))
+        
+        # Periodically refresh remote config (every 5 minutes)
+        if not hasattr(update_monitor_ui, "last_config_refresh"):
+            update_monitor_ui.last_config_refresh = 0
+            
+        if time.time() - update_monitor_ui.last_config_refresh > 300:
+            global BUY_DISABLE_MAX_LOSS, PROGRESSIVE_LOSS_CONFIG
+            
+            # Refresh Max Loss
+            new_limit = fetch_remote_config(REMOTE_CONFIG_URL, BUY_DISABLE_MAX_LOSS)
+            if new_limit != BUY_DISABLE_MAX_LOSS:
+                BUY_DISABLE_MAX_LOSS = new_limit
+                log_with_callback(log_cb, f"🔄 Max Loss Limit updated from remote: {BUY_DISABLE_MAX_LOSS}")
+            
+            # Refresh Progressive Config
+            new_prog = fetch_remote_json(PROGRESSIVE_LOSS_URL, PROGRESSIVE_LOSS_CONFIG)
+            if new_prog != PROGRESSIVE_LOSS_CONFIG:
+                PROGRESSIVE_LOSS_CONFIG = new_prog
+                log_with_callback(log_cb, "🔄 Progressive Loss Config updated from remote.")
+                
+            update_monitor_ui.last_config_refresh = time.time()
 
 def process_buy_disable_logic(engine):
-    if not ENABLE_BUY_DISABLE:
-        return
 
     # 1. Load current lockout state from file
     current_trade_id_in_file = None
@@ -1083,18 +1159,24 @@ def process_buy_disable_logic(engine):
                 lockout_active = time.time() < data.get("disabled_until", 0)
         except: pass
 
-    # 2. Check for Max Loss/Profit Lockout
+    # 2. Check for Progressive Max Loss Lockout
     completed = engine.completed_trades
     net_pnl = sum(t["net_pnl"] for t in completed)
+    loss_amount = -net_pnl
     today_str = datetime.now().strftime("%Y-%m-%d")
 
-    if net_pnl <= -BUY_DISABLE_MAX_LOSS:
-        if current_trade_id_in_file != "max_loss":
-             disabled_until = time.time() + 86400 # 24 hours
-             with open(BUY_DISABLED_FILE, 'w') as f:
-                 json.dump({"disabled_until": disabled_until, "last_trade_id": "max_loss", "date": today_str}, f)
-             log_with_callback(log_cb, f"CRITICAL: Net Loss {net_pnl} exceeds limit {BUY_DISABLE_MAX_LOSS}. Buy disabled until tomorrow.")
-        return
+    # Check progressive thresholds (Highest first)
+    for threshold, duration_mins in PROGRESSIVE_LOSS_CONFIG:
+        if loss_amount >= threshold:
+            label = f"max_loss_{threshold}"
+            if current_trade_id_in_file != label:
+                disabled_until = time.time() + (duration_mins * 60)
+                with open(BUY_DISABLED_FILE, 'w') as f:
+                    json.dump({"disabled_until": disabled_until, "last_trade_id": label, "date": today_str}, f)
+                
+                duration_str = f"{duration_mins} mins" if duration_mins < 1440 else "tomorrow"
+                log_with_callback(log_cb, f"WARNING: Net Loss {net_pnl} hit threshold {threshold}. Buy disabled for {duration_str}.")
+            return # Exit after triggering the highest threshold
 
     if net_pnl >= BUY_DISABLE_MAX_PROFIT:
         if current_trade_id_in_file != "max_profit":
@@ -1156,26 +1238,69 @@ def process_buy_disable_logic(engine):
         except Exception as e:
             log_with_callback(log_cb, f"DEBUG: Re-enable check failed: {e}")
 
-def save_trades_to_csv(completed):
+def save_trades_to_csv(trades_to_log):
+    if not trades_to_log:
+        return
     try:
         import csv
         os.makedirs("logs", exist_ok=True)
         filename = f"logs/trades_{datetime.now().strftime('%Y-%m-%d')}.csv"
-        with open(filename, "w", newline="") as f:
-            writer = csv.writer(f)
+        
+        # Check existing Buy IDs in file to avoid logical duplicates
+        existing_buy_ids = set()
+        file_exists = os.path.exists(filename)
+        if file_exists:
+            try:
+                with open(filename, "r") as r:
+                    reader = csv.DictReader(r)
+                    for row in reader:
+                        bid = row.get("Buy ID")
+                        if bid: existing_buy_ids.add(bid)
+            except: pass
+
+        with open(filename, "a", newline="") as f:
             headers = ["Symbol", "Trade Type", "Date", "Buy Time", "Sell Time", "Qty", "Buy Price", "Sell Price", "Gross PnL", "Charges", "Net PnL", 
-                       "Exit Reason", "E_Sig", "E_EMA", "E_ROC", "E_BBW", "X_Sig", "X_EMA", "X_ROC", "X_BBW"]
-            writer.writerow(headers)
-            for t in completed:
-                row = [
-                    t["symbol"], t.get("trade_type", "Manual"), t.get("trade_date"), t.get("buy_time"), t.get("sell_time"), t.get("buy_qty"), 
-                    t.get("buy_price"), t.get("sell_price"), t.get("gross_pnl"), t.get("charges"), t.get("net_pnl"),
-                    t.get("exit_reason", "N/A"),
-                    t.get("entry_sig", "N/A"), t.get("entry_ema", "N/A"), t.get("entry_roc", "N/A"), t.get("entry_bbw", "N/A"),
-                    t.get("exit_sig", "N/A"), t.get("exit_ema", "N/A"), t.get("exit_roc", "N/A"), t.get("exit_bbw", "N/A")
-                ]
+                       "Buy ID", "Sell ID", "Exit Reason", "E_Sig", "E_EMA", "E_ROC", "E_BBW", "X_Sig", "X_EMA", "X_ROC", "X_BBW"]
+            writer = csv.DictWriter(f, fieldnames=headers)
+            if not file_exists:
+                writer.writeheader()
+            
+            logged_count = 0
+            for t in trades_to_log:
+                # Skip if already in file
+                bid = str(t.get("buy_order_id", ""))
+                if bid in existing_buy_ids:
+                    continue
+                
+                row = {
+                    "Symbol": t["symbol"],
+                    "Trade Type": t.get("trade_type", "Manual"),
+                    "Date": t.get("trade_date"),
+                    "Buy Time": t.get("buy_time"),
+                    "Sell Time": t.get("sell_time"),
+                    "Qty": t.get("buy_qty"),
+                    "Buy Price": t.get("buy_price"),
+                    "Sell Price": t.get("sell_price"),
+                    "Gross PnL": t.get("gross_pnl"),
+                    "Charges": t.get("charges"),
+                    "Net PnL": t.get("net_pnl"),
+                    "Buy ID": bid,
+                    "Sell ID": t.get("sell_order_id"),
+                    "Exit Reason": t.get("exit_reason", "Manual/API"),
+                    "E_Sig": t.get("entry_sig", "N/A"),
+                    "E_EMA": t.get("entry_ema", "N/A"),
+                    "E_ROC": t.get("entry_roc", "N/A"),
+                    "E_BBW": t.get("entry_bbw", "N/A"),
+                    "X_Sig": t.get("exit_sig", "N/A"),
+                    "X_EMA": t.get("exit_ema", "N/A"),
+                    "X_ROC": t.get("exit_roc", "N/A"),
+                    "X_BBW": t.get("exit_bbw", "N/A")
+                }
                 writer.writerow(row)
-        log_with_callback(log_cb, f"📝 Trades logged to {filename}")
+                logged_count += 1
+                
+        if logged_count > 0:
+            log_with_callback(log_cb, f"📝 {logged_count} new trades logged to {filename}")
     except Exception as e:
         log_with_callback(log_cb, f"CSV Error: {e}")
 

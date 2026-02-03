@@ -1,8 +1,9 @@
 # config.py
-from dotenv import load_dotenv
 import os
+from dotenv import load_dotenv
+from common.utils import fetch_remote_config, fetch_remote_json, get_resource_path
 
-load_dotenv()
+load_dotenv(get_resource_path(".env"))
 
 CONSUMER_KEY = os.getenv("CONSUMER_KEY")
 MOBILE = os.getenv("MOBILE")
@@ -12,24 +13,40 @@ MPIN = os.getenv("MPIN")
 LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "75"))
 
 # Scrip Master constants
-NSE_SCRIP_MASTER_PATH = os.getenv("NSE_SCRIP_MASTER_PATH", "nse_fo.csv")
-BSE_SCRIP_MASTER_PATH = os.getenv("BSE_SCRIP_MASTER_PATH", "bse_fo.csv")
+NSE_SCRIP_MASTER_PATH = get_resource_path(os.getenv("NSE_SCRIP_MASTER_PATH", "nse_fo.csv"))
+BSE_SCRIP_MASTER_PATH = get_resource_path(os.getenv("BSE_SCRIP_MASTER_PATH", "bse_fo.csv"))
 DEFAULT_TRADING_SYMBOL = ""
 EXPIRY_STR = "26120" # YYMDD format (e.g. 26120 for 20th Jan 2026)
 
 # Buy disable feature
-ENABLE_BUY_DISABLE = True
 BUY_DISABLE_LOSS_COUNT = 3  # Number of continuous losses to disable buying
 BUY_DISABLE_DURATION = 120  # seconds
-BUY_DISABLE_MAX_LOSS = 500   # Disable buying if net loss exceeds this amount
-BUY_DISABLE_MAX_PROFIT = 1000 # Disable buying if net profit exceeds this amount
-RESET_OVERRIDE_DURATION = 600  # seconds; manual RESET enables buy for this long (default 10 min)
+ENABLE_BUY_DISABLE = True   # Enable/Disable the lockout feature
+
+# Progressive Loss Lockout (Loss amount, Duration in minutes)
+# Once a threshold is hit, buying is disabled for the specified duration.
+PROGRESSIVE_LOSS_CONFIG_DEFAULT = [
+    (2000, 1440), # 2000 loss -> Hard stop (24 hours)
+    (1500, 60),   # 1500 loss -> 60 minutes
+    (1000, 30),   # 1000 loss -> 30 minutes
+    (500, 15),    # 500 loss -> 15 minutes
+]
+
+# Remote config for Maximum Loss (Higher friction to cheat)
+# Replace these URLs with your own private GitHub Gist (Raw) URLs
+REMOTE_CONFIG_URL = os.getenv("REMOTE_CONFIG_URL", "https://gist.githubusercontent.com/SriniArch/a81d5c68cdb91a432225b26833bef01d/raw/bbe73c6bcf1fd858d66d1f48e72eded224887ce1/gistfile1.txt")
+PROGRESSIVE_LOSS_URL = os.getenv("PROGRESSIVE_LOSS_URL", "https://gist.githubusercontent.com/SriniArch/0a485812216952d95e0dfc02f5e8a018/raw/cec7b0f5a160e217ef2d487ce05e0bba774e009b/progressive_loss.json")
+
+PROGRESSIVE_LOSS_CONFIG = fetch_remote_json(PROGRESSIVE_LOSS_URL, PROGRESSIVE_LOSS_CONFIG_DEFAULT)
+
+BUY_DISABLE_MAX_LOSS = 2000 # Final hard stop if not covered by progressive config
+BUY_DISABLE_MAX_PROFIT = 2000 # Disable buying if net profit exceeds this amount
 COOL_OFF_PERIOD = 10 # seconds; minimum gap between trades
 
 # Per-trade default risk management
-DEFAULT_TARGET = 10.0
+DEFAULT_TARGET = 5
 DEFAULT_SL = 5
-DEFAULT_TSL_STEP = 3.0 # Points move required to trail SL (0 to disable)
+DEFAULT_TSL_STEP = 2 # Points move required to trail SL (0 to disable)
 
 # LTP Logger feature
 ENABLE_LTP_LOGGER = False

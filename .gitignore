@@ -8,5 +8,8 @@ output.json
 symbol_history.json
 .venv/
 *.csv
+*.txt
 miniforge.sh
 logs/*.json
+*.json
+
