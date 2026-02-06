@@ -45,6 +45,8 @@ active_trade_metadata = {} # Snapshot of indicators at entry/exit
 last_exit_reason = "" # Track last exit reason for logging
 last_exit_time = 0   # ⏱️ Track when the last trade ended for cool-off period
 pnl_engine = PositionPnLEngine() # Shared engine for PnL tracking
+market_sideways = False # Track if market is currently sideways
+market_exhausted = False # Track if market is currently exhausted
 
 
 # ---------------------------------------------------------
@@ -80,6 +82,8 @@ style.configure("PE.TButton", background="#fdecea", foreground="#991b1b")
 
 style.configure("Auto.TButton", background="#fef9c3")  # Default yellow-ish
 style.configure("AutoOn.TButton", background="#4ade80", font=("Segoe UI", 11, "bold"))
+style.configure("Sideways.TButton", background="#e5e7eb", font=("Segoe UI", 11, "bold"))
+style.map("Sideways.TButton", background=[("active", "#d1d5db")])
 
 # ---------------------------------------------------------
 # MAIN LAYOUT
@@ -367,7 +371,9 @@ def trigger_override():
             with open(BUY_DISABLED_FILE, 'r') as f:
                 data = json.load(f)
             reason = data.get("last_trade_id")
-            if reason == "max_loss" or reason == "max_loss_2000":
+            rem = data.get("disabled_until", 0) - time.time()
+            # If it's a 24-hour lockout (Hard Stop)
+            if reason == "max_loss" or (reason.startswith("max_loss") and rem > 80000):
                 today = datetime.now().strftime("%Y-%m-%d")
                 if data.get("date") == today:
                     log_with_callback(log_cb, "⛔ HARD STOP: Max Loss limit reached. Cannot override until tomorrow.")
@@ -401,7 +407,12 @@ def update_status_label():
     if disabled:
         buy_btn.config(state="disabled")
         if reason.startswith("max_loss"):
-            if reason == "max_loss_2000" or reason == "max_loss":
+            # A "Hard Stop" is defined as a lockout of 24 hours (1440 mins) or more
+            # We use 86000 as a buffer for 86400 seconds (24h)
+            is_static_hard_stop = (reason == "max_loss")
+            is_dynamic_hard_stop = (remaining > 80000) 
+            
+            if is_static_hard_stop or is_dynamic_hard_stop:
                 status_label.config(text="Buy Disabled - Max Loss (Hard Stop)", foreground="red")
             else:
                 mins = int(remaining // 60)
@@ -423,7 +434,17 @@ def update_status_label():
         else:
             if not buy_active:
                 buy_btn.config(state="normal")
-            status_label.config(text="Buy Enabled", foreground="green")
+                if market_sideways:
+                    buy_btn.config(style="Sideways.TButton")
+                    status_label.config(text="Market Sideways (Caution)", foreground="#f59e0b")
+                else:
+                    buy_btn.config(style="Buy.TButton")
+                    status_label.config(text="Buy Enabled", foreground="green")
+            else:
+                # buy_active is True
+                buy_btn.config(state="disabled")
+                buy_btn.config(style="Buy.TButton")
+                status_label.config(text="Position Active", foreground="green")
     root.after(1000, update_status_label)
 
 
@@ -434,8 +455,8 @@ def do_buy(trade_type="Manual"):
     disabled, remaining, reason = is_buy_disabled()
     if disabled:
         if reason.startswith("max_loss"):
-            if reason == "max_loss_2000" or reason == "max_loss":
-                msg = f"Buy disabled. Net loss has reached the hard stop limit of {BUY_DISABLE_MAX_LOSS}."
+            if remaining > 80000 or reason == "max_loss":
+                msg = f"Buy disabled. Net loss has reached the daily hard stop limit."
             else:
                 mins = int(remaining // 60)
                 secs = int(remaining % 60)
@@ -942,15 +963,22 @@ def update_monitor_ui():
         indicator_data = scalp_manager.get_signal()
         sig = indicator_data['signal']
         
+        global market_sideways, market_exhausted
+        market_sideways = indicator_data.get("sideways", False)
+        market_exhausted = indicator_data.get("exhausted", False)
+
         if sig == "BULLISH":
             trade_status = "📈 BULLISH SETUP"
             trade_color = "#10b981" # Emerald Green
         elif sig == "BEARISH":
             trade_status = "📉 BEARISH SETUP"
             trade_color = "#10b981" # Emerald Green
-        elif sig == "SIDEWAYS (PINCHED)":
+        elif market_sideways:
             trade_status = "⏸️ MARKET SIDEWAYS"
             trade_color = "#f97316" # Orange
+        elif market_exhausted:
+            trade_status = "⚠️ MARKET EXHAUSTED"
+            trade_color = "#ef4444" # Red
         elif sig == "NEUTRAL":
             trade_status = "⚖️ NEUTRAL / WAITING"
             trade_color = "#6b7280" # Gray
@@ -962,6 +990,11 @@ def update_monitor_ui():
         else:
             trade_status = f"🔍 {sig}"
             trade_color = "#ef4444" # Red
+            
+        # Expansion Pulse Detection Feedback
+        if indicator_data.get("pulse"):
+            trade_status = f"⚡ {trade_status} (PULSE DETECTED)"
+            trade_color = "#3b82f6" # Bright Blue
 
         # 🎯 AUTOMATIC TARGET EXIT LOGIC
         if buy_active and not exit_pending:
@@ -1032,39 +1065,57 @@ def update_monitor_ui():
                     return
                 elif auto_mode and active_trade_metadata.get("symbol") == active_symbol:
                     # REFINED EXIT LOGIC:
-                    # 1. ROC Stalls (Negative for BULLISH, Positive for BEARISH)
+                    # 1. ROC Decay Exit: > 25% drop from peak
                     # 2. BBW Contraction (current < entry)
                     # 3. Time-Stop (20s)
+                    # 4. Dynamic Trailing SL: BE+0.5 at 3pts profit
                     
                     e_bbw = active_trade_metadata.get("entry_bbw", 0)
+                    e_roc = active_trade_metadata.get("entry_roc", 0)
                     e_ts = active_trade_metadata.get("entry_time_ts", 0)
                     cur_bbw = indicator_data.get("bb_width", 0)
                     cur_roc = indicator_data.get("roc", 0)
                     duration = time.time() - e_ts if e_ts > 0 else 0
 
-                    # Determine if we are in a CE or PE trade based on entry signal
-                    entry_sig = active_trade_metadata.get("entry_sig", "")
+                    # Track Peak ROC for decay exit
+                    peak_roc = active_trade_metadata.get("peak_roc", abs(e_roc))
+                    if abs(cur_roc) > peak_roc:
+                        peak_roc = abs(cur_roc)
+                        active_trade_metadata["peak_roc"] = peak_roc
                     
                     exit_needed = False
                     exit_reason = ""
                     
-                    if entry_sig == "BULLISH" and cur_roc < -0.005: 
+                    # 1. ROC Decay Exit (>25% drop from peak)
+                    if peak_roc > 0 and abs(cur_roc) < (peak_roc * 0.75):
                         exit_needed = True
-                        exit_reason = "ROC Stall"
-                    elif entry_sig == "BEARISH" and cur_roc > 0.005:
-                        exit_needed = True
-                        exit_reason = "ROC Stall"
-                    elif cur_bbw < (e_bbw * 0.90) and e_bbw > 0:
+                        exit_reason = "ROC Decay (>25%)"
+                    
+                    # 2. BBW Contraction (Indicating squeeze)
+                    elif cur_bbw < e_bbw:
                         exit_needed = True
                         exit_reason = "BBW Contraction"
+                    
+                    # 3. Time-Stop (20s)
                     elif duration > 20:
                         exit_needed = True
                         exit_reason = "Time-Stop (20s)"
                     
+                    # 4. Dynamic Trailing SL: BE+0.5 at 3pts profit
+                    if not exit_needed:
+                        if profit >= 3.0:
+                            if not active_trade_metadata.get("tsl_active"):
+                                active_trade_metadata["tsl_active"] = True
+                                log_with_callback(log_cb, "🛡️ Trailing SL: Locked at BE + 0.5 pts")
+                        
+                        if active_trade_metadata.get("tsl_active") and profit < 0.5:
+                            exit_needed = True
+                            exit_reason = "Trailing SL (BE+0.5)"
+                    
                     if exit_needed:
                         log_with_callback(log_cb, f"🛡️ AUTO EXIT: {exit_reason} detected ({profit:+.2f} pts). Exiting...")
                         run_bg(do_exit, reason=exit_reason)
-                        return # Stop further processing this tick to avoid double exit
+                        return 
         
         lines.append("-" * 20)
         lines.append(f"Source: {idx_name or tr_for_quote}")
@@ -1147,42 +1198,60 @@ def update_monitor_ui():
             update_monitor_ui.last_config_refresh = time.time()
 
 def process_buy_disable_logic(engine):
+    # 1. Daily Stats
+    completed = engine.completed_trades
+    net_pnl = sum(t.get("net_pnl", 0) for t in completed)
+    loss_amount = -net_pnl
+    today_str = datetime.now().strftime("%Y-%m-%d")
 
-    # 1. Load current lockout state from file
-    current_trade_id_in_file = None
-    lockout_active = False
+    # Load highest threshold hit today to prevent "downgrading" lockouts
+    current_label = None
+    highest_threshold_hit = 0
+    disabled_until_ts = 0
     if os.path.exists(BUY_DISABLED_FILE):
         try:
             with open(BUY_DISABLED_FILE, 'r') as f:
                 data = json.load(f)
-                current_trade_id_in_file = data.get("last_trade_id")
-                lockout_active = time.time() < data.get("disabled_until", 0)
+                if data.get("date") == today_str:
+                    current_label = data.get("last_trade_id")
+                    highest_threshold_hit = data.get("highest_threshold", 0)
+                    disabled_until_ts = data.get("disabled_until", 0)
         except: pass
 
-    # 2. Check for Progressive Max Loss Lockout
-    completed = engine.completed_trades
-    net_pnl = sum(t["net_pnl"] for t in completed)
-    loss_amount = -net_pnl
-    today_str = datetime.now().strftime("%Y-%m-%d")
-
-    # Check progressive thresholds (Highest first)
+    # Find the single highest applicable threshold
+    app_t = 0
+    app_d = 0
     for threshold, duration_mins in PROGRESSIVE_LOSS_CONFIG:
         if loss_amount >= threshold:
-            label = f"max_loss_{threshold}"
-            if current_trade_id_in_file != label:
-                disabled_until = time.time() + (duration_mins * 60)
-                with open(BUY_DISABLED_FILE, 'w') as f:
-                    json.dump({"disabled_until": disabled_until, "last_trade_id": label, "date": today_str}, f)
-                
-                duration_str = f"{duration_mins} mins" if duration_mins < 1440 else "tomorrow"
-                log_with_callback(log_cb, f"WARNING: Net Loss {net_pnl} hit threshold {threshold}. Buy disabled for {duration_str}.")
-            return # Exit after triggering the highest threshold
+            app_t = threshold
+            app_d = duration_mins
+            break
+            
+    # Handle Recovery: If we improved below the highest threshold hit earlier
+    if highest_threshold_hit > 0 and loss_amount < highest_threshold_hit:
+        log_with_callback(log_cb, f"📈 Recovery Detected: Net Loss {net_pnl:.2f} is improving (Previous worst: {highest_threshold_hit}).")
+        # Clear lockout immediately as losses are reducing
+        with open(BUY_DISABLED_FILE, 'w') as f:
+            json.dump({"disabled_until": 0, "last_trade_id": "recovery", "date": today_str, "highest_threshold": app_t}, f)
+        log_with_callback(log_cb, "✅ Recovery: Buying re-enabled as losses are reducing.")
+        return
+
+    # Handle New/Higher Lockout
+    if app_t > 0:
+        label = f"max_loss_{app_t}"
+        if app_t > highest_threshold_hit or (app_t == highest_threshold_hit and current_label != label):
+            disabled_until_ts = time.time() + (app_d * 60)
+            with open(BUY_DISABLED_FILE, 'w') as f:
+                json.dump({"disabled_until": disabled_until_ts, "last_trade_id": label, "date": today_str, "highest_threshold": app_t}, f)
+            dur_str = f"{app_d} mins" if app_d < 1440 else "tomorrow"
+            log_with_callback(log_cb, f"⚠️ LOCKOUT: Loss {loss_amount:.2f} hit {app_t}. Buy disabled for {dur_str}.")
+        return
 
     if net_pnl >= BUY_DISABLE_MAX_PROFIT:
-        if current_trade_id_in_file != "max_profit":
-             disabled_until = time.time() + 86400 # 24 hours
+        if current_label != "max_profit":
+             disabled_until_ts = time.time() + 86400 # 24 hours
              with open(BUY_DISABLED_FILE, 'w') as f:
-                 json.dump({"disabled_until": disabled_until, "last_trade_id": "max_profit", "date": today_str}, f)
+                 json.dump({"disabled_until": disabled_until_ts, "last_trade_id": "max_profit", "date": today_str}, f)
              log_with_callback(log_cb, f"SUCCESS: Net Profit {net_pnl} exceeds limit {BUY_DISABLE_MAX_PROFIT}. Buy disabled until tomorrow.")
         return
 
@@ -1193,48 +1262,35 @@ def process_buy_disable_logic(engine):
         last_trade_time = last_n[-1].get("sell_time") or last_n[-1].get("buy_time")
         last_trade_ts = str(last_trade_time.timestamp()) if hasattr(last_trade_time, 'timestamp') else str(last_trade_time)
         
-        if all(t["net_pnl"] < 0 for t in last_n) and last_trade_ts != current_trade_id_in_file:
-            disabled_until = time.time() + BUY_DISABLE_DURATION
+        if all(t.get("net_pnl", 0) < 0 for t in last_n) and last_trade_ts != current_label:
+            disabled_until_ts = time.time() + BUY_DISABLE_DURATION
             with open(BUY_DISABLED_FILE, 'w') as f:
-                json.dump({"disabled_until": disabled_until, "last_trade_id": last_trade_ts, "date": today_str}, f)
+                json.dump({"disabled_until": disabled_until_ts, "last_trade_id": last_trade_ts, "date": today_str}, f)
             log_with_callback(log_cb, f"INFO: Buy disabled for {BUY_DISABLE_DURATION // 60} mins due to {BUY_DISABLE_LOSS_COUNT} losses.")
             return
 
-    # 4. Check for Re-enable (Time passed, new day, or limit changed)
+    # 4. Check for Static Re-enable (Time passed or new day)
     if os.path.exists(BUY_DISABLED_FILE):
         try:
-            # Check lockout state again to ensure we have latest from file
-            with open(BUY_DISABLED_FILE, 'r') as f:
-                data = json.load(f)
-            
-            saved_date = data.get("date")
-            reason = data.get("last_trade_id")
-            disabled_until_ts = data.get("disabled_until", 0)
-            
-            # Reset if new day
-            if saved_date != today_str:
-                os.remove(BUY_DISABLED_FILE)
-                log_with_callback(log_cb, "INFO: Buy limits reset for the new day.")
+            # Check if lockout should be lifted based on time
+            if time.time() >= disabled_until_ts:
+                # Lockout time expired. We only clear it if we are also not currently in a threshold.
+                if app_t == 0:
+                    # UPDATE file instead of deleting, to keep the last_trade_id memory
+                    with open(BUY_DISABLED_FILE, 'r') as f:
+                        data = json.load(f)
+                    data["disabled_until"] = 0 
+                    with open(BUY_DISABLED_FILE, 'w') as f:
+                        json.dump(data, f)
+                    log_with_callback(log_cb, f"✅ Lockout expired ({current_label}). Buy re-enabled.")
                 return
 
-            # Check if lockout should be lifted
-            lockout_expired = time.time() >= disabled_until_ts
-            pnl_recovered = False
-            
-            if reason == "max_profit" and net_pnl < BUY_DISABLE_MAX_PROFIT:
-                pnl_recovered = True
-            elif reason == "max_loss" and net_pnl > -BUY_DISABLE_MAX_LOSS:
-                pnl_recovered = True
+            # Special recovery check for Max Profit
+            if current_label == "max_profit" and net_pnl < BUY_DISABLE_MAX_PROFIT:
+                os.remove(BUY_DISABLED_FILE)
+                log_with_callback(log_cb, "✅ Profit Recovery: Buy re-enabled.")
+                return
 
-            if (lockout_expired or pnl_recovered) and disabled_until_ts > 0:
-                data["disabled_until"] = 0
-                with open(BUY_DISABLED_FILE, 'w') as f:
-                    json.dump(data, f)
-                
-                msg = "INFO: Buy re-enabled."
-                if pnl_recovered:
-                    msg = f"INFO: Buy re-enabled (PnL {net_pnl:.2f} within new limits)."
-                log_with_callback(log_cb, msg)
         except Exception as e:
             log_with_callback(log_cb, f"DEBUG: Re-enable check failed: {e}")
 
@@ -1260,7 +1316,7 @@ def save_trades_to_csv(trades_to_log):
 
         with open(filename, "a", newline="") as f:
             headers = ["Symbol", "Trade Type", "Date", "Buy Time", "Sell Time", "Qty", "Buy Price", "Sell Price", "Gross PnL", "Charges", "Net PnL", 
-                       "Buy ID", "Sell ID", "Exit Reason", "E_Sig", "E_EMA", "E_ROC", "E_BBW", "X_Sig", "X_EMA", "X_ROC", "X_BBW"]
+                       "Buy ID", "Sell ID", "Order Source", "Exit Reason", "E_Sig", "E_EMA", "E_ROC", "E_BBW", "X_Sig", "X_EMA", "X_ROC", "X_BBW"]
             writer = csv.DictWriter(f, fieldnames=headers)
             if not file_exists:
                 writer.writeheader()
@@ -1272,6 +1328,12 @@ def save_trades_to_csv(trades_to_log):
                 if bid in existing_buy_ids:
                     continue
                 
+                # Combine Buy and Sell sources for display
+                b_src = t.get("order_source", "NA")
+                s_src = t.get("sell_order_source", "NA")
+                combined_src = f"B:{b_src} | S:{s_src}"
+                if b_src == s_src: combined_src = b_src
+
                 row = {
                     "Symbol": t["symbol"],
                     "Trade Type": t.get("trade_type", "Manual"),
@@ -1286,6 +1348,7 @@ def save_trades_to_csv(trades_to_log):
                     "Net PnL": t.get("net_pnl"),
                     "Buy ID": bid,
                     "Sell ID": t.get("sell_order_id"),
+                    "Order Source": combined_src,
                     "Exit Reason": t.get("exit_reason", "Manual/API"),
                     "E_Sig": t.get("entry_sig", "N/A"),
                     "E_EMA": t.get("entry_ema", "N/A"),

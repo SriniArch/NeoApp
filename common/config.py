@@ -26,21 +26,23 @@ ENABLE_BUY_DISABLE = True   # Enable/Disable the lockout feature
 # Progressive Loss Lockout (Loss amount, Duration in minutes)
 # Once a threshold is hit, buying is disabled for the specified duration.
 PROGRESSIVE_LOSS_CONFIG_DEFAULT = [
-    (2000, 1440), # 2000 loss -> Hard stop (24 hours)
-    (1500, 60),   # 1500 loss -> 60 minutes
-    (1000, 30),   # 1000 loss -> 30 minutes
-    (500, 15),    # 500 loss -> 15 minutes
+    (2501, 1440), # >2500 loss -> Hard stop (24 hours)
+    (2500, 30),   # 2500 loss -> 30 minutes
+    (2000, 20),   # 2000 loss -> 20 minutes
+    (1500, 15),   # 1500 loss -> 15 minutes
+    (1000, 10),   # 1000 loss -> 10 minutes
+    (500, 5),     # 500 loss -> 5 minutes
 ]
 
 # Remote config for Maximum Loss (Higher friction to cheat)
 # Replace these URLs with your own private GitHub Gist (Raw) URLs
-REMOTE_CONFIG_URL = os.getenv("REMOTE_CONFIG_URL", "https://gist.githubusercontent.com/SriniArch/a81d5c68cdb91a432225b26833bef01d/raw/bbe73c6bcf1fd858d66d1f48e72eded224887ce1/gistfile1.txt")
-PROGRESSIVE_LOSS_URL = os.getenv("PROGRESSIVE_LOSS_URL", "https://gist.githubusercontent.com/SriniArch/0a485812216952d95e0dfc02f5e8a018/raw/cec7b0f5a160e217ef2d487ce05e0bba774e009b/progressive_loss.json")
+REMOTE_CONFIG_URL = os.getenv("REMOTE_CONFIG_URL", "https://gist.githubusercontent.com/SriniArch/a81d5c68cdb91a432225b26833bef01d/raw/gistfile1.txt")
+PROGRESSIVE_LOSS_URL = os.getenv("PROGRESSIVE_LOSS_URL", "https://gist.githubusercontent.com/SriniArch/0a485812216952d95e0dfc02f5e8a018/raw/progressive_loss.json")
 
 PROGRESSIVE_LOSS_CONFIG = fetch_remote_json(PROGRESSIVE_LOSS_URL, PROGRESSIVE_LOSS_CONFIG_DEFAULT)
 
-BUY_DISABLE_MAX_LOSS = 2000 # Final hard stop if not covered by progressive config
-BUY_DISABLE_MAX_PROFIT = 2000 # Disable buying if net profit exceeds this amount
+BUY_DISABLE_MAX_LOSS = 2501 # Final hard stop if not covered by progressive config
+BUY_DISABLE_MAX_PROFIT = 2500 # Disable buying if net profit exceeds this amount
 COOL_OFF_PERIOD = 10 # seconds; minimum gap between trades
 
 # Per-trade default risk management

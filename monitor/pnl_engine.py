@@ -16,6 +16,7 @@ class Trade:
     product: str       # MIS / NRML
     segment: str       # nse_cm / nse_fo / bse_fo
     order_id: str = ""
+    order_source: str = "NA"
 
 
 # =========================
@@ -24,14 +25,14 @@ class Trade:
 class ChargesCalculator:
 
     @staticmethod
-    def calculate(turnover: float, segment: str) -> float:
+    def calculate(turnover: float, segment: str, brokerage: float = 0.0) -> float:
         """
         Approx Indian charges.
-        Brokerage assumed ZERO.
+        Brokerage is passed explicitly.
         """
         exch = turnover * 0.0000325
         sebi = turnover * 0.000001
-        gst = 0.18 * (exch + sebi)
+        gst = 0.18 * (exch + sebi + brokerage)
         stamp = turnover * 0.00015
 
         # STT rules
@@ -40,7 +41,7 @@ class ChargesCalculator:
         else:
             stt = turnover * 0.0007       # F&O sell
 
-        return round(stt + exch + sebi + gst + stamp, 2)
+        return round(stt + exch + sebi + gst + stamp + brokerage, 2)
 
 
 # =========================
@@ -114,6 +115,8 @@ def parse_api_orders(api_data: List[dict]) -> List[Trade]:
     trades = []
 
     for o in api_data:
+        # DBG: Print full order object to finding source field
+        if o == api_data[0]: print(f"DEBUG: Order Object Structure: {o}")
         raw_status = str(o.get("ordSt", ""))
         status = raw_status.lower()
         if status not in ["complete", "completed", "filled"]:
@@ -172,7 +175,8 @@ def parse_api_orders(api_data: List[dict]) -> List[Trade]:
             time=trade_time,
             product=str(o.get("prod", "MIS")),
             segment=str(o.get("exSeg", "")),
-            order_id=str(o.get("nOrdNo", ""))
+            order_id=str(o.get("nOrdNo", "")),
+            order_source=str(o.get("ordSrc", "NA"))
         )
         trades.append(trade)
         #print(f"DEBUG: Parsed Trade - {trade.side} {trade.qty} {trade.symbol} @ {trade.price} ({trade.time})")
@@ -197,6 +201,7 @@ class PositionPnLEngine:
                 "open_qty": trade.qty,
                 "buy_time": trade.time,
                 "buy_order_id": trade.order_id,
+                "order_source": trade.order_source, # Carry order_source for buy
                 "gross_pnl": 0.0,
                 "charges": 0.0
             })
@@ -209,9 +214,26 @@ class PositionPnLEngine:
                 pos = self.open_trades[symbol][0]
                 matched_qty = min(sell_qty, pos["open_qty"])
 
+                # Brokerage logic: Flat 10 if order source is Broker Website (TFC_W)
+                # Note: We apply brokerage on the MATCHED lot. 
+                # If either the Buy OR the Sell was from Web, we apply it? 
+                # Usually brokerage is per order. Let's assume 10 if the Sell was from Web for now, 
+                # or check both.
+                
+                brokerage = 0.0
+                # If source is NOT our terminal (NEOTRADEAPI), apply 10 point brokerage
+                # 'trade' is the Sell, 'pos' is the matching Buy
+                sell_src = trade.order_source
+                buy_src = pos.get("order_source", "NA")
+
+                if sell_src != "NA" and "NEOTRADEAPI" not in sell_src:
+                    brokerage += 10.0
+                if buy_src != "NA" and "NEOTRADEAPI" not in buy_src:
+                    brokerage += 10.0
+
                 pnl = (trade.price - pos["buy_price"]) * matched_qty
                 turnover = (trade.price + pos["buy_price"]) * matched_qty
-                charges = ChargesCalculator.calculate(turnover, trade.segment)
+                charges = ChargesCalculator.calculate(turnover, trade.segment, brokerage=brokerage)
 
                 pos["gross_pnl"] += pnl
                 pos["charges"] += charges
@@ -224,6 +246,7 @@ class PositionPnLEngine:
                     pos["sell_price"] = trade.price
                     pos["sell_time"] = trade.time
                     pos["sell_order_id"] = trade.order_id
+                    pos["sell_order_source"] = trade.order_source # Carry order_source for sell
                     pos["trade_date"] = trade.time.date()
 
                     self.completed_trades.append(pos)

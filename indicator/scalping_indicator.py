@@ -106,57 +106,79 @@ class LiveScalpingManager:
     def get_signal(self) -> dict:
         """
         Calculate indicators on current history and return signal + values.
-        Enhanced strategy: EMA, ROC (rising, 30-period), BB Width > 15.0, 7-tick sequence.
+        Enhanced strategy: EMA, ROC (18-period), BB Expansion (>20%), 
+        Floor Thresh (NIFTY 12.0, SENSEX 20.0)
         """
-        # Need at least 30 data points for ROC(30)
-        if len(self.history) < 30:
-            needed = 30 - len(self.history)
-            return {"signal": f"WAITING ({needed} pts)", "ema": 0, "roc": 0, "bb_width": 0, "roc_rising": False}
+        # Need at least 20 data points for calculations
+        if len(self.history) < 20:
+            needed = 20 - len(self.history)
+            return {"signal": f"WAITING ({needed} pts)", "ema": 0, "roc": 0, "bb_width": 0, "pulse": False}
 
         prices = self.history['ltp'].astype(float)
+        symbol = str(self.history['symbol'].iloc[-1]).upper()
         
         # 1. EMA (9)
         ema_series = ScalpingIndicator.calculate_ema(prices, 9)
         ema = ema_series.iloc[-1]
         
-        # 2. ROC (30) - Extended period for smoother trend detection
-        roc_series = ScalpingIndicator.calculate_roc(prices, 30)
+        # 2. ROC (18) - Faster response to micro-trends
+        roc_series = ScalpingIndicator.calculate_roc(prices, 18)
         roc = roc_series.iloc[-1]
         
-        # Check if ROC is trending up over last 3 ticks (relaxed from 5 strict)
+        # Check if ROC is trending up over last 2 ticks
         roc_rising = False
-        if len(roc_series) >= 3:
-            r_vals = roc_series.iloc[-3:].tolist()
-            roc_rising = r_vals[-1] > r_vals[0] and r_vals[-1] > 0
+        if len(roc_series) >= 2:
+            roc_rising = roc_series.iloc[-1] > roc_series.iloc[-2] and roc_series.iloc[-1] > 0
         
         # 3. BB Width (20, 2)
         bb_width_series = ScalpingIndicator.calculate_bb_width(prices, 20, 2)
         bb_width = bb_width_series.iloc[-1]
+        prev_bbw = bb_width_series.iloc[-2] if len(bb_width_series) > 1 else bb_width
         
-        # 4. Sequence - Relaxed to 4 ticks and allows equality as long as net gain
-        if len(prices) >= 4:
-            last_4 = prices.iloc[-4:].tolist()
-            up_seq = all(last_4[i] <= last_4[i+1] for i in range(len(last_4)-1)) and last_4[-1] > last_4[0]
-            down_seq = all(last_4[i] >= last_4[i+1] for i in range(len(last_4)-1)) and last_4[-1] < last_4[0]
+        # Breakout Trigger: BBW expansion > 20% in one tick
+        bb_expansion_pulse = bb_width > (prev_bbw * 1.2)
+        
+        # 4. Sequence - Reduced to 2-3 ticks for faster entry
+        if len(prices) >= 2:
+            last_2 = prices.iloc[-2:].tolist()
+            up_seq_2 = last_2[-1] > last_2[0]
+            down_seq_2 = last_2[-1] < last_2[0]
+            
+            up_seq_3 = False
+            down_seq_3 = False
+            if len(prices) >= 3:
+                last_3 = prices.iloc[-3:].tolist()
+                up_seq_3 = all(last_3[i] <= last_3[i+1] for i in range(len(last_3)-1)) and last_3[-1] > last_3[0]
+                down_seq_3 = all(last_3[i] >= last_3[i+1] for i in range(len(last_3)-1)) and last_3[-1] < last_3[0]
+                
+            up_seq = up_seq_3 or up_seq_2
+            down_seq = down_seq_3 or down_seq_2
         else:
             up_seq = False
             down_seq = False
         
-        # Strategy Logic: BBW > 10.0 (Relaxed from 15.0), ROC exhaustion filter
-        is_volatile = bb_width > 10.0
-        roc_exhausted = abs(roc) > 10.0  # Avoid buying at spike peaks
+        # Floor Thresholds
+        bbw_floor = 12.0 # Default NIFTY
+        roc_ceiling = 0.15 # Default NIFTY
+        if "SENSEX" in symbol or "BSX" in symbol or "BANKEX" in symbol:
+            bbw_floor = 20.0
+            roc_ceiling = 12.0
+            
+        is_sideways = bb_width < bbw_floor
+        is_exhausted = abs(roc) > roc_ceiling
 
         p_now = prices.iloc[-1]
         signal = "NEUTRAL"
-        if is_volatile and not roc_exhausted:
-            if p_now > ema and roc > 0 and roc_rising and up_seq:
+        
+        if is_exhausted:
+            signal = "EXHAUSTED (ROC CEILING)"
+        elif is_sideways:
+            signal = f"SIDEWAYS (BBW {round(bb_width, 1)} < {bbw_floor})"
+        elif bb_expansion_pulse:
+            if p_now > ema and roc > 0 and up_seq:
                 signal = "BULLISH"
-            elif p_now < ema and roc < 0 and not roc_rising and down_seq: # Falling ROC for bearish
+            elif p_now < ema and roc < 0 and down_seq:
                 signal = "BEARISH"
-        elif roc_exhausted:
-            signal = "EXHAUSTED (ROC TOO HIGH)"
-        else:
-            signal = f"SIDEWAYS (BBW {round(bb_width, 1)} < 10.0)"
         
         return {
             "signal": signal,
@@ -165,6 +187,9 @@ class LiveScalpingManager:
             "roc_rising": roc_rising,
             "bb_width": round(bb_width, 2),
             "ltp": p_now,
+            "pulse": bb_expansion_pulse,
+            "exhausted": is_exhausted,
+            "sideways": is_sideways,
             "trend": "UP" if up_seq else "DOWN" if down_seq else "FLAT"
         }
 
