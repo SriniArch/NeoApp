@@ -46,12 +46,33 @@ BUY_DISABLE_MAX_PROFIT = 2500 # Disable buying if net profit exceeds this amount
 COOL_OFF_PERIOD = 10 # seconds; minimum gap between trades
 
 # Per-trade default risk management
-DEFAULT_TARGET = 5
-DEFAULT_SL = 5
-DEFAULT_TSL_STEP = 2 # Points move required to trail SL (0 to disable)
+NIFTY_CONFIG = {
+    "target": 2,
+    "sl": 1.5,
+    "tsl": 1,
+    "pt": 1
+}
+
+SENSEX_CONFIG = {
+    "target": 5,
+    "sl": 4,
+    "tsl": 2,
+    "pt": 2
+}
+
+DEFAULT_TARGET = NIFTY_CONFIG["target"]
+DEFAULT_SL = NIFTY_CONFIG["sl"]
+DEFAULT_TSL_STEP = NIFTY_CONFIG["tsl"]
+DEFAULT_TP_TSL = NIFTY_CONFIG["pt"]
 
 # LTP Logger feature
 ENABLE_LTP_LOGGER = False
+
+# Capital Tracking
+INITIAL_CAPITAL_DEFAULT = 8000.0  # Initial capital if no history exists
+CAPITAL_HISTORY_FILE = "capital_history.csv"
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", INITIAL_CAPITAL_DEFAULT))
+CAPITAL_TOPUP = 0.0 # One-time adjustment (Add money: +5000, Withdraw: -5000)
 
 # UI & Strategy refresh interval in milliseconds
 REFRESH_INTERVAL_MS = 1000

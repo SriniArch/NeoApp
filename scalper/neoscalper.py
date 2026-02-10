@@ -10,7 +10,7 @@ import os
 # Allow importing from parent directory
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from common.config import DEFAULT_TRADING_SYMBOL, BUY_DISABLE_DURATION, BUY_DISABLE_LOSS_COUNT, BUY_DISABLE_MAX_LOSS, BUY_DISABLE_MAX_PROFIT, PROGRESSIVE_LOSS_CONFIG, PROGRESSIVE_LOSS_CONFIG_DEFAULT, REFRESH_INTERVAL_MS, DEFAULT_TARGET, DEFAULT_SL, DEFAULT_TSL_STEP, COOL_OFF_PERIOD, REMOTE_CONFIG_URL, PROGRESSIVE_LOSS_URL
+from common.config import DEFAULT_TRADING_SYMBOL, BUY_DISABLE_DURATION, BUY_DISABLE_LOSS_COUNT, BUY_DISABLE_MAX_LOSS, BUY_DISABLE_MAX_PROFIT, PROGRESSIVE_LOSS_CONFIG, PROGRESSIVE_LOSS_CONFIG_DEFAULT, REFRESH_INTERVAL_MS, DEFAULT_TARGET, DEFAULT_SL, DEFAULT_TSL_STEP, DEFAULT_TP_TSL, COOL_OFF_PERIOD, REMOTE_CONFIG_URL, PROGRESSIVE_LOSS_URL, NIFTY_CONFIG, SENSEX_CONFIG, INITIAL_CAPITAL, CAPITAL_HISTORY_FILE, CAPITAL_TOPUP
 from common.utils import log_with_callback, run_bg, fetch_remote_config, fetch_remote_json, get_resource_path
 from common.scrip_master import load_scrip_master_csv, find_token_for_trading_symbol
 from common.orders import ensure_login as do_login, place_market_order, get_client, detect_exchange_segment, detect_strike_step
@@ -44,7 +44,35 @@ max_price_seen = 0.0 # Peak price for trailing SL tracking
 active_trade_metadata = {} # Snapshot of indicators at entry/exit
 last_exit_reason = "" # Track last exit reason for logging
 last_exit_time = 0   # ⏱️ Track when the last trade ended for cool-off period
-pnl_engine = PositionPnLEngine() # Shared engine for PnL tracking
+# Capital & Rollover Initialization
+def get_latest_capital():
+    base = INITIAL_CAPITAL
+    if os.path.exists(CAPITAL_HISTORY_FILE):
+        try:
+            df = pd.read_csv(CAPITAL_HISTORY_FILE)
+            if not df.empty:
+                base = float(df.iloc[-1]["Closing Capital"])
+        except: pass
+    return base + CAPITAL_TOPUP
+
+def get_monthly_pnl_summary(current_net_pnl=0.0):
+    """Calculates total net PnL for the current month from history + current session."""
+    monthly_pnl = current_net_pnl
+    if os.path.exists(CAPITAL_HISTORY_FILE):
+        try:
+            df = pd.read_csv(CAPITAL_HISTORY_FILE)
+            if not df.empty:
+                df['Date'] = pd.to_datetime(df['Date'])
+                current_month = datetime.now().month
+                current_year = datetime.now().year
+                mask = (df['Date'].dt.month == current_month) & (df['Date'].dt.year == current_year)
+                monthly_pnl += df[mask]['Net PnL'].sum()
+        except Exception as e:
+            print(f"Error calculating monthly PnL: {e}")
+    return round(monthly_pnl, 2)
+
+pnl_engine = PositionPnLEngine(initial_capital=get_latest_capital()) 
+eod_saved_today = False 
 market_sideways = False # Track if market is currently sideways
 market_exhausted = False # Track if market is currently exhausted
 
@@ -194,6 +222,24 @@ def update_symbol_option(symbol: str, new_type: str) -> str:
         return s[:-2] + new_type
     return s + new_type
 
+def update_params_by_symbol(*args):
+    """Updates Target, SL, TSL, and PT based on the index of the symbol."""
+    cur_sym = tr_symbol.get().strip().upper()
+    if not cur_sym: return
+    
+    config = None
+    if "NIFTY" in cur_sym:
+        config = NIFTY_CONFIG
+    elif "SENSEX" in cur_sym or "BSX" in cur_sym:
+        config = SENSEX_CONFIG
+        
+    if config:
+        target_var.set(str(config["target"]))
+        sl_var.set(str(config["sl"]))
+        trail_var.set(str(config["tsl"]))
+        pt_var.set(str(config["pt"]))
+        log_with_callback(log_cb, f"⚙️ Params updated for {cur_sym}")
+
 
 def load_history():
     if os.path.exists(HISTORY_FILE):
@@ -290,9 +336,14 @@ ttk.Label(param_frame, text="Trl:").pack(side="left", padx=(10, 2))
 trail_var = tk.StringVar(value=str(DEFAULT_TSL_STEP))
 ttk.Entry(param_frame, textvariable=trail_var, width=5).pack(side="left", padx=2)
 
+ttk.Label(param_frame, text="PT:").pack(side="left", padx=(10, 2))
+pt_var = tk.StringVar(value=str(DEFAULT_TP_TSL))
+ttk.Entry(param_frame, textvariable=pt_var, width=5).pack(side="left", padx=2)
+
 # 4️⃣ SYMBOL SELECTION (Row 3)
 ttk.Label(frm, text="Symbol:").grid(row=3, column=0, sticky="e", pady=5, padx=5)
 tr_symbol = tk.StringVar(value=DEFAULT_TRADING_SYMBOL)
+tr_symbol.trace_add("write", update_params_by_symbol)
 history = load_history()
 symbol_combo = ttk.Combobox(frm, textvariable=tr_symbol, values=history, width=32)
 symbol_combo.grid(row=3, column=1, columnspan=5, sticky="w", pady=5)
@@ -852,7 +903,7 @@ def update_monitor_ui():
         
         if report_data and isinstance(report_data, list):
             # Refreshed engine with latest data
-            new_engine = PositionPnLEngine()
+            new_engine = PositionPnLEngine(initial_capital=pnl_engine.initial_capital)
             trades = parse_api_orders(report_data)
             trades.sort(key=lambda x: x.time)
             for t in trades:
@@ -892,6 +943,11 @@ def update_monitor_ui():
         
         last_str = " | ".join(str(p) for p in pnls[-5:])
 
+        # 🎯 CAPITAL CALCULATION
+        cur_cap = pnl_engine.get_current_capital()
+        pct_pnl = pnl_engine.get_pnl_percentage()
+        m_pnl = get_monthly_pnl_summary(net)
+
         lines = [
             f"Trades: {len(completed)}",
             f"W/L   : {wins}/{losses} ({win_rate}%)",
@@ -899,6 +955,10 @@ def update_monitor_ui():
             f"Gross PnL: {gross}",
             f"Net PnL  : {net}",
             f"Charges  : {charges}",
+            "-" * 20,
+            f"Capital  : {cur_cap:.2f}",
+            f"PnL %    : {pct_pnl:+.2f}%",
+            f"Month PnL: {m_pnl:+.2f}",
             "-" * 20,
             f"Recent: {last_str}"
         ]
@@ -963,9 +1023,28 @@ def update_monitor_ui():
         indicator_data = scalp_manager.get_signal()
         sig = indicator_data['signal']
         
-        global market_sideways, market_exhausted
+        global market_sideways, market_exhausted, eod_saved_today
         market_sideways = indicator_data.get("sideways", False)
         market_exhausted = indicator_data.get("exhausted", False)
+
+        # 🎯 EOD LOGIC
+        now = datetime.now()
+        # Save EOD Capital at 3:30 PM (15:30)
+        if now.hour == 15 and now.minute >= 30 and not eod_saved_today:
+            try:
+                row = {"Date": now.strftime("%Y-%m-%d"), "Initial Capital": pnl_engine.initial_capital, "Net PnL": net, "Closing Capital": cur_cap, "% Change": pct_pnl}
+                file_exists = os.path.exists(CAPITAL_HISTORY_FILE)
+                with open(CAPITAL_HISTORY_FILE, "a", newline="") as f:
+                    import csv
+                    writer = csv.DictWriter(f, fieldnames=row.keys())
+                    if not file_exists: writer.writeheader()
+                    writer.writerow(row)
+                eod_saved_today = True
+                log_with_callback(log_cb, f"🏁 EOD Capital Saved: {cur_cap:.2f} ({pct_pnl:+.2f}%)")
+            except Exception as ee:
+                log_with_callback(log_cb, f"⚠️ EOD Save Error: {ee}")
+        elif now.hour < 9: # Reset for new day
+            eod_saved_today = False
 
         if sig == "BULLISH":
             trade_status = "📈 BULLISH SETUP"
@@ -992,7 +1071,7 @@ def update_monitor_ui():
             trade_color = "#ef4444" # Red
             
         # Expansion Pulse Detection Feedback
-        if indicator_data.get("pulse"):
+        if indicator_data.get("pulse") and not market_sideways:
             trade_status = f"⚡ {trade_status} (PULSE DETECTED)"
             trade_color = "#3b82f6" # Bright Blue
 
@@ -1035,6 +1114,7 @@ def update_monitor_ui():
                 target = float(target_var.get() or 0)
                 initial_sl = float(sl_var.get() or 0)
                 trail_step = float(trail_var.get() or 0)
+                pt_step = float(pt_var.get() or 0)
                 
                 # Update Max Price for Trailing
                 if cur_ltp > max_price_seen:
@@ -1056,66 +1136,22 @@ def update_monitor_ui():
                     print(f"DEBUG: Track Exit | {active_symbol} | LTP: {cur_ltp} | Profit: {profit:+.2f} | Tgt: {target} | SL: {-effective_sl_pts:.2f}")
 
                 if auto_mode and profit >= target:
-                    log_with_callback(log_cb, f"🎯 TARGET REACHED ({profit:+.2f} pts). Exiting...")
-                    run_bg(do_exit, reason="Target")
-                    return
+                    if pt_step > 0:
+                        max_profit = max_price_seen - last_buy_price
+                        if profit <= (max_profit - pt_step):
+                            log_with_callback(log_cb, f"🎯 TRAILING PROFIT HIT (Peak {max_profit:+.2f} -> Current {profit:+.2f}). Exiting...")
+                            run_bg(do_exit, reason="Trail-Profit")
+                            return
+                        # If PT is set but not hit yet, we display a special status
+                        lines.append(f"PT Active: Break below {max_profit-pt_step:.2f}")
+                    else:
+                        log_with_callback(log_cb, f"🎯 TARGET REACHED ({profit:+.2f} pts). Exiting...")
+                        run_bg(do_exit, reason="Target")
+                        return
                 elif auto_mode and profit <= -effective_sl_pts:
                     log_with_callback(log_cb, f"🛑 STOP LOSS HIT ({profit:+.2f} pts). Exiting...")
                     run_bg(do_exit, reason="SL")
                     return
-                elif auto_mode and active_trade_metadata.get("symbol") == active_symbol:
-                    # REFINED EXIT LOGIC:
-                    # 1. ROC Decay Exit: > 25% drop from peak
-                    # 2. BBW Contraction (current < entry)
-                    # 3. Time-Stop (20s)
-                    # 4. Dynamic Trailing SL: BE+0.5 at 3pts profit
-                    
-                    e_bbw = active_trade_metadata.get("entry_bbw", 0)
-                    e_roc = active_trade_metadata.get("entry_roc", 0)
-                    e_ts = active_trade_metadata.get("entry_time_ts", 0)
-                    cur_bbw = indicator_data.get("bb_width", 0)
-                    cur_roc = indicator_data.get("roc", 0)
-                    duration = time.time() - e_ts if e_ts > 0 else 0
-
-                    # Track Peak ROC for decay exit
-                    peak_roc = active_trade_metadata.get("peak_roc", abs(e_roc))
-                    if abs(cur_roc) > peak_roc:
-                        peak_roc = abs(cur_roc)
-                        active_trade_metadata["peak_roc"] = peak_roc
-                    
-                    exit_needed = False
-                    exit_reason = ""
-                    
-                    # 1. ROC Decay Exit (>25% drop from peak)
-                    if peak_roc > 0 and abs(cur_roc) < (peak_roc * 0.75):
-                        exit_needed = True
-                        exit_reason = "ROC Decay (>25%)"
-                    
-                    # 2. BBW Contraction (Indicating squeeze)
-                    elif cur_bbw < e_bbw:
-                        exit_needed = True
-                        exit_reason = "BBW Contraction"
-                    
-                    # 3. Time-Stop (20s)
-                    elif duration > 20:
-                        exit_needed = True
-                        exit_reason = "Time-Stop (20s)"
-                    
-                    # 4. Dynamic Trailing SL: BE+0.5 at 3pts profit
-                    if not exit_needed:
-                        if profit >= 3.0:
-                            if not active_trade_metadata.get("tsl_active"):
-                                active_trade_metadata["tsl_active"] = True
-                                log_with_callback(log_cb, "🛡️ Trailing SL: Locked at BE + 0.5 pts")
-                        
-                        if active_trade_metadata.get("tsl_active") and profit < 0.5:
-                            exit_needed = True
-                            exit_reason = "Trailing SL (BE+0.5)"
-                    
-                    if exit_needed:
-                        log_with_callback(log_cb, f"🛡️ AUTO EXIT: {exit_reason} detected ({profit:+.2f} pts). Exiting...")
-                        run_bg(do_exit, reason=exit_reason)
-                        return 
         
         lines.append("-" * 20)
         lines.append(f"Source: {idx_name or tr_for_quote}")
@@ -1282,7 +1318,7 @@ def process_buy_disable_logic(engine):
                     data["disabled_until"] = 0 
                     with open(BUY_DISABLED_FILE, 'w') as f:
                         json.dump(data, f)
-                    log_with_callback(log_cb, f"✅ Lockout expired ({current_label}). Buy re-enabled.")
+                    #log_with_callback(log_cb, f"✅ Lockout expired ({current_label}). Buy re-enabled.")
                 return
 
             # Special recovery check for Max Profit
@@ -1393,6 +1429,11 @@ def render_monitor_display(lines, net_val, gross_val):
             tag = None
             if line.startswith("Net"): tag = "green" if net_val > 0 else "red"
             elif line.startswith("Gross"): tag = "green" if gross_val > 0 else "red"
+            elif line.startswith("Month PnL"):
+                try:
+                    m_val = float(line.split(": ")[1])
+                    tag = "green" if m_val > 0 else "red" if m_val < 0 else None
+                except: tag = None
             elif "Allowed to Trade" in line: tag = "green"
             elif "Dont Trade" in line: tag = "red"
             mon_text.insert(tk.END, line + "\n", tag)

@@ -185,9 +185,19 @@ def parse_api_orders(api_data: List[dict]) -> List[Trade]:
 
 class PositionPnLEngine:
 
-    def __init__(self):
+    def __init__(self, initial_capital=0.0):
         self.open_trades = defaultdict(deque)        # key = symbol, value = deque of open positions
         self.completed_trades = []
+        self.initial_capital = initial_capital
+
+    def get_current_capital(self):
+        net_pnl = sum(t.get("net_pnl", 0) for t in self.completed_trades)
+        return self.initial_capital + net_pnl
+
+    def get_pnl_percentage(self):
+        if self.initial_capital == 0: return 0.0
+        net_pnl = sum(t.get("net_pnl", 0) for t in self.completed_trades)
+        return round((net_pnl / self.initial_capital) * 100, 2)
 
     def add_trade(self, trade: Trade):
         symbol = trade.symbol.strip().upper()
