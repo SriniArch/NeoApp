@@ -26,17 +26,36 @@ def detect_exchange_segment(trading_symbol: str) -> str:
 
 def detect_strike_step(trading_symbol: str) -> int:
     s = trading_symbol.upper()
-    if "SENSEX" in s or "BANKEX" in s:
-        return 100
     if "BANKNIFTY" in s:
         return 100
-    return 50 # Nifty, Finnifty, Midcap
+    if "FINNIFTY" in s:
+        return 50
+    if "MIDCPNIFTY" in s:
+        return 25
+    if "SENSEX" in s or "BANKEX" in s:
+        return 100
+    if "NIFTY" in s:
+        return 50
+    return 50 # Default for others
 
 def place_market_order(token, lots, side, trading_symbol, log_cb=None):
     client = ensure_login(log_cb)
     
     exchange_segment = detect_exchange_segment(trading_symbol)
     lot_size = get_lot_size_from_scrip_master(trading_symbol, default=1)
+    
+    # Robust Fallback for Lot Size if scrip master is out of sync
+    if lot_size == 1:
+        s = trading_symbol.upper()
+        if "BANKNIFTY" in s: lot_size = 30
+        elif "FINNIFTY" in s: lot_size = 60
+        elif "MIDCPNIFTY" in s: lot_size = 120
+        elif "NIFTY" in s: lot_size = 65
+        elif "SENSEX" in s or "BANKEX" in s: lot_size = 20
+        
+        if lot_size != 1:
+            log_with_callback(log_cb, f"⚠️ Scrip master lot size not found. Using 2026 default for {s}: {lot_size}")
+
     qty = int(lots) * lot_size
 
     log_with_callback(log_cb, f"Placing {side} market order for {qty} of {trading_symbol} ({exchange_segment})")

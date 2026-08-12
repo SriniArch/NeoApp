@@ -1,5 +1,6 @@
 # config.py
 import os
+import json
 from dotenv import load_dotenv
 from common.utils import fetch_remote_config, fetch_remote_json, get_resource_path
 
@@ -15,8 +16,43 @@ LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "75"))
 # Scrip Master constants
 NSE_SCRIP_MASTER_PATH = get_resource_path(os.getenv("NSE_SCRIP_MASTER_PATH", "nse_fo.csv"))
 BSE_SCRIP_MASTER_PATH = get_resource_path(os.getenv("BSE_SCRIP_MASTER_PATH", "bse_fo.csv"))
-DEFAULT_TRADING_SYMBOL = ""
-EXPIRY_STR = "26120" # YYMDD format (e.g. 26120 for 20th Jan 2026)
+DEFAULT_TRADING_SYMBOL = "NIFTY"
+
+from datetime import datetime, timedelta
+
+def get_next_expiry(symbol: str) -> str:
+    """
+    Returns the nearest expiry date string (YYMDD) for the given symbol.
+    NIFTY: Tuesday expiry, SENSEX: Thursday expiry.
+    If today is expiry day and before 3:30pm, use today. Otherwise, use next week.
+    """
+    now = datetime.now()
+    weekday = now.weekday()  # Monday=0, Sunday=6
+    symbol_upper = symbol.upper()
+    if symbol_upper == "NIFTY":
+        expiry_weekday = 1  # Tuesday
+    elif symbol_upper == "SENSEX":
+        expiry_weekday = 3  # Thursday
+    else:
+        expiry_weekday = 1  # Default to Tuesday
+
+    # Calculate days until expiry weekday
+    days_ahead = (expiry_weekday - weekday) % 7
+    expiry = now + timedelta(days=days_ahead)
+    expiry_time = expiry.replace(hour=15, minute=30, second=0, microsecond=0)
+
+    # If today is expiry day and before expiry time, use today
+    if weekday == expiry_weekday and now < expiry_time:
+        expiry = now
+    # If today is after expiry time, move to next week's expiry
+    elif weekday == expiry_weekday and now >= expiry_time:
+        expiry = now + timedelta(days=7)
+    # Otherwise, expiry is this week's upcoming expiry weekday
+    # Neo symbols now use YYMDD (month without leading zero), e.g. 26813 for 2026-08-13.
+    expiry_str = f"{expiry:%y}{expiry.month}{expiry:%d}"
+    print(f"[DEBUG] get_next_expiry called: now={now}, symbol={symbol}, expiry_str={expiry_str}")
+    return expiry_str
+
 
 # Buy disable feature
 BUY_DISABLE_LOSS_COUNT = 3  # Number of continuous losses to disable buying
@@ -44,6 +80,26 @@ PROGRESSIVE_LOSS_CONFIG = fetch_remote_json(PROGRESSIVE_LOSS_URL, PROGRESSIVE_LO
 BUY_DISABLE_MAX_LOSS = 2501 # Final hard stop if not covered by progressive config
 BUY_DISABLE_MAX_PROFIT = 2500 # Disable buying if net profit exceeds this amount
 COOL_OFF_PERIOD = 10 # seconds; minimum gap between trades
+TELEGRAM_COOL_OFF = int(os.getenv("TELEGRAM_COOL_OFF", "60"))  # seconds between telegram alerts
+
+# Telegram recipients: prefer JSON list in TELEGRAM_CONFIGS, fallback to single token/chat env vars.
+_telegram_configs_raw = os.getenv("TELEGRAM_CONFIGS", "").strip()
+TELEGRAM_CONFIGS = []
+if _telegram_configs_raw:
+    try:
+        parsed = json.loads(_telegram_configs_raw)
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if isinstance(parsed, list):
+            TELEGRAM_CONFIGS = [c for c in parsed if isinstance(c, dict)]
+    except Exception:
+        TELEGRAM_CONFIGS = []
+
+if not TELEGRAM_CONFIGS:
+    _bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    _chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if _bot_token and _chat_id:
+        TELEGRAM_CONFIGS = [{"token": _bot_token, "chat_id": _chat_id}]
 
 # Per-trade default risk management
 NIFTY_CONFIG = {
@@ -78,7 +134,9 @@ ENABLE_LTP_LOGGER = False
 INITIAL_CAPITAL_DEFAULT = 8000.0  # Initial capital if no history exists
 CAPITAL_HISTORY_FILE = "capital_history.csv"
 INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", INITIAL_CAPITAL_DEFAULT))
-CAPITAL_TOPUP = 0.0 # One-time adjustment (Add money: +5000, Withdraw: -5000)
+CAPITAL_TOPUP = float(os.getenv("CAPITAL_TOPUP", "0"))  # One-time adjustment (Add money: +5000, Withdraw: -5000)
+PNL_RESET_DATE = os.getenv("PNL_RESET_DATE", "")
+MAX_DAILY_LOSS_COUNT = int(os.getenv("MAX_DAILY_LOSS_COUNT", "50"))
 
 # UI & Strategy refresh interval in milliseconds
 REFRESH_INTERVAL_MS = 1000

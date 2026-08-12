@@ -69,3 +69,40 @@ def get_resource_path(relative_path):
         base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     return os.path.join(base_path, relative_path)
+
+def send_telegram_msg(message: str) -> None:
+    """Send a message via Telegram Bot to all configured recipients."""
+    try:
+        # Import inside function to avoid circular dependency with config.py
+        from .config import TELEGRAM_CONFIGS
+        import urllib.request
+        import json
+
+        if not TELEGRAM_CONFIGS:
+            return
+
+        for config in TELEGRAM_CONFIGS:
+            token = config.get("token")
+            chat_id = config.get("chat_id")
+            
+            if not token or not chat_id:
+                continue
+
+            try:
+                url = f"https://api.telegram.org/bot{token}/sendMessage"
+                payload = {
+                    "chat_id": chat_id,
+                    "text": message,
+                    "parse_mode": "Markdown"
+                }
+                
+                data = json.dumps(payload).encode('utf-8')
+                req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+                
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    pass # Success
+            except Exception as e:
+                print(f"Failed to send to Telegram chat {chat_id}: {e}")
+            
+    except Exception as e:
+        print(f"Failed to initialize Telegram sending: {e}")

@@ -2,8 +2,12 @@
 import os
 import pandas as pd
 from typing import Optional
+import time
+from datetime import datetime
 from .utils import log_with_callback
 from .config import NSE_SCRIP_MASTER_PATH, BSE_SCRIP_MASTER_PATH
+from .neo_login import get_neo_client
+import requests
 
 _scrip_master_df: Optional[pd.DataFrame] = None
 _token_cache: dict = {}
@@ -15,6 +19,35 @@ def load_scrip_master_csv(paths: Optional[list] = None, log_cb=None) -> None:
     """
     global _scrip_master_df, _token_cache
     
+    # --- Auto Update Scrip Master Logic ---
+    try:
+        # Check if nse_fo.csv is older than today
+        needs_update = True
+        if os.path.exists(NSE_SCRIP_MASTER_PATH):
+            mtime = os.path.getmtime(NSE_SCRIP_MASTER_PATH)
+            mdate = datetime.fromtimestamp(mtime).date()
+            if mdate == datetime.now().date():
+                needs_update = False
+        
+        if needs_update:
+            log_with_callback(log_cb, "Scrip master is outdated. Downloading latest from Kotak...")
+            try:
+                client = get_neo_client()
+                url = client.scrip_master(exchange_segment="nse_fo")
+                headers = {"Authorization": f"Bearer {client.access_token}"} if hasattr(client, 'access_token') else {}
+                resp = requests.get(url, headers=headers)
+                if resp.status_code == 200:
+                    with open(NSE_SCRIP_MASTER_PATH, 'wb') as f:
+                        f.write(resp.content)
+                    log_with_callback(log_cb, "Successfully downloaded new NSE scrip master!")
+                else:
+                    log_with_callback(log_cb, f"Failed to download scrip master. HTTP Details: {resp.status_code}")
+            except Exception as dl_err:
+                log_with_callback(log_cb, f"Download scrip master error: {dl_err}")
+    except Exception as e:
+        log_with_callback(log_cb, f"Scrip master update check failed: {e}")
+    # --------------------------------------
+
     target_paths = paths or [NSE_SCRIP_MASTER_PATH, BSE_SCRIP_MASTER_PATH]
     
     all_dfs = []

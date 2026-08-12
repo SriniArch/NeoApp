@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox
 import sys, os, re, difflib
 import pandas as pd
 from datetime import datetime
+import csv
 
 import sys
 import os
@@ -10,8 +11,8 @@ import os
 # Allow importing from parent directory
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from common.config import DEFAULT_TRADING_SYMBOL, BUY_DISABLE_DURATION, BUY_DISABLE_LOSS_COUNT, BUY_DISABLE_MAX_LOSS, BUY_DISABLE_MAX_PROFIT, PROGRESSIVE_LOSS_CONFIG, PROGRESSIVE_LOSS_CONFIG_DEFAULT, REFRESH_INTERVAL_MS, DEFAULT_TARGET, DEFAULT_SL, DEFAULT_TSL_STEP, DEFAULT_TP_TSL, COOL_OFF_PERIOD, REMOTE_CONFIG_URL, PROGRESSIVE_LOSS_URL, NIFTY_CONFIG, SENSEX_CONFIG, INITIAL_CAPITAL, CAPITAL_HISTORY_FILE, CAPITAL_TOPUP, RSIM_RSI_UP, RSIM_RSI_DOWN, RSIM_SUSTAIN_TICKS
-from common.utils import log_with_callback, run_bg, fetch_remote_config, fetch_remote_json, get_resource_path
+from common.config import DEFAULT_TRADING_SYMBOL, BUY_DISABLE_DURATION, BUY_DISABLE_LOSS_COUNT, BUY_DISABLE_MAX_LOSS, BUY_DISABLE_MAX_PROFIT, PROGRESSIVE_LOSS_CONFIG, PROGRESSIVE_LOSS_CONFIG_DEFAULT, REFRESH_INTERVAL_MS, DEFAULT_TARGET, DEFAULT_SL, DEFAULT_TSL_STEP, DEFAULT_TP_TSL, COOL_OFF_PERIOD, TELEGRAM_COOL_OFF, REMOTE_CONFIG_URL, PROGRESSIVE_LOSS_URL, NIFTY_CONFIG, SENSEX_CONFIG, INITIAL_CAPITAL, CAPITAL_HISTORY_FILE, CAPITAL_TOPUP, PNL_RESET_DATE, MAX_DAILY_LOSS_COUNT, RSIM_RSI_UP, RSIM_RSI_DOWN, RSIM_SUSTAIN_TICKS, get_next_expiry
+from common.utils import log_with_callback, run_bg, fetch_remote_config, fetch_remote_json, get_resource_path, send_telegram_msg
 from common.scrip_master import load_scrip_master_csv, find_token_for_trading_symbol
 from common.orders import ensure_login as do_login, place_market_order, get_client, detect_exchange_segment, detect_strike_step
 from indicator.scalping_indicator import LiveScalpingManager, RSIMomentumStrategy
@@ -45,51 +46,92 @@ max_price_seen = 0.0 # Peak price for trailing SL tracking
 active_trade_metadata = {} # Snapshot of indicators at entry/exit
 last_exit_reason = "" # Track last exit reason for logging
 last_exit_time = 0   # ⏱️ Track when the last trade ended for cool-off period
+last_mom_alert_time = 0 # ⏱️ Cooldown for Ultra Momentum Telegram alerts
+mom_threshold_start = 0 # ⏱️ Track when momentum threshold was first crossed
 # Capital & Rollover Initialization
 def get_latest_capital():
-    """Fetches the latest closing capital from history or uses default.
-    If today's EOD was already saved, we use today's Initial Capital to avoid double counting today's orders.
+    """Fetches the latest balance from history. 
+    If today's entry already exists, we use today's LAST Closing Capital as the starting point 
+    for this session's PnL calculations.
     """
     base = INITIAL_CAPITAL
     if os.path.exists(CAPITAL_HISTORY_FILE):
         try:
             df = pd.read_csv(CAPITAL_HISTORY_FILE)
             if not df.empty:
+                # Ensure Added column compatibility
+                if "Added" not in df.columns:
+                    df["Added"] = 0.0
+
                 df['Date'] = pd.to_datetime(df['Date']).dt.date
                 today = datetime.now().date()
                 today_entry = df[df['Date'] == today]
                 if not today_entry.empty:
+                    # ⚠️ FIX: On restart within the SAME day, use today's ORIGINAL Initial Capital.
+                    # This allows the PnL engine (which rebuilds from ALL daily orders) to 
+                    # correctly calculate the Daily % and Current Capital relative to day-start.
                     base = float(today_entry.iloc[0]["Initial Capital"])
                 else:
-                    base = float(df.iloc[-1]["Closing Capital"])
+                    last_row = df.iloc[-1]
+                    closing = float(last_row["Closing Capital"])
+                    added = float(last_row.get("Added", 0))
+                    base = closing + added
         except Exception as e:
             print(f"Error reading capital history: {e}")
     return base + CAPITAL_TOPUP
 
-def get_monthly_pnl_summary(current_net_pnl=0.0):
-    """Calculates total net PnL for the current month from history + current session.
-    Filters out today's history entry to avoid double counting with current session.
+def get_overall_pnl_summary(current_net_pnl=0.0):
+    """Calculates total net PnL percentage since PNL_RESET_DATE.
     """
-    monthly_pnl = current_net_pnl
+    total_pnl = current_net_pnl
+    base_cap = pnl_engine.initial_capital
     if os.path.exists(CAPITAL_HISTORY_FILE):
         try:
             df = pd.read_csv(CAPITAL_HISTORY_FILE)
             if not df.empty:
                 df['Date'] = pd.to_datetime(df['Date'])
                 now = datetime.now()
-                # Sum Net PNL for current month EXCLUDING today
-                mask = (df['Date'].dt.month == now.month) & \
-                       (df['Date'].dt.year == now.year) & \
-                       (df['Date'].dt.date < now.date())
-                monthly_pnl += df[mask]['Net PnL'].sum()
+                
+                # History sum (excluding today)
+                mask = (df['Date'].dt.date < now.date())
+                
+                if PNL_RESET_DATE:
+                    try:
+                        reset_dt = pd.to_datetime(PNL_RESET_DATE).date()
+                        mask = mask & (df['Date'].dt.date >= reset_dt)
+                        
+                        # Find original capital from reset date to use as base
+                        reset_row = df[df['Date'].dt.date == reset_dt]
+                        if not reset_row.empty:
+                            base_cap = float(reset_row.iloc[0]["Initial Capital"])
+                    except: pass
+
+                # Take ONLY the last entry for each date to avoid double-counting
+                daily_summary = df[mask].groupby(df['Date'].dt.date).last()
+                total_pnl += daily_summary['Net PnL'].sum()
+                
+                # Update base_cap to include any Added capital since reset
+                if PNL_RESET_DATE:
+                    total_added = daily_summary['Added'].sum() if 'Added' in daily_summary else 0
+                    base_cap += total_added
         except Exception as e:
-            print(f"Error calculating monthly PnL: {e}")
-    return round(monthly_pnl, 2)
+            print(f"Error calculating overall PnL: {e}")
+            
+    if base_cap == 0: return 0.0
+    return round((total_pnl / base_cap) * 100, 2)
 
 pnl_engine = PositionPnLEngine(initial_capital=get_latest_capital()) 
 eod_saved_today = False 
 market_sideways = False # Track if market is currently sideways
 market_exhausted = False # Track if market is currently exhausted
+
+# Store last index data for immediate UI updates
+last_idx_ltp = 0
+last_idx_name = ""
+
+# Track last logged values to prevent duplicate logs
+last_logged_strike = None
+last_logged_params_symbol = ""
 
 
 # ---------------------------------------------------------
@@ -125,8 +167,95 @@ style.configure("PE.TButton", background="#fdecea", foreground="#991b1b")
 
 style.configure("Auto.TButton", background="#fef9c3")  # Default yellow-ish
 style.configure("AutoOn.TButton", background="#4ade80", font=("Segoe UI", 11, "bold"))
-style.configure("Sideways.TButton", background="#e5e7eb", font=("Segoe UI", 11, "bold"))
-style.map("Sideways.TButton", background=[("active", "#d1d5db")])
+style.configure("Sideways.TButton", background="#ffedd5", font=("Segoe UI", 11, "bold"))
+style.map("Sideways.TButton", background=[("active", "#fed7aa")])
+
+style.configure("Locked.TButton", background="#991b1b", foreground="white", font=("Segoe UI", 11, "bold"))
+style.map("Locked.TButton", background=[("active", "#7f1d1d")])
+
+def save_capital_to_csv(session_initial_cap, session_net_pnl, session_closing_cap, session_pct_change, session_trades):
+    """Saves session results to capital_history.csv. 
+    If a row for today already exists, it ACCUMULATES pnl and trades while preserving 
+    today's original Initial Capital for overall % calculation.
+    """
+    global eod_saved_today
+    try:
+        now_str = datetime.now().strftime("%Y-%m-%d")
+        
+        # Read existing data
+        rows = []
+        file_exists = os.path.exists(CAPITAL_HISTORY_FILE)
+        header = ["Date", "Initial Capital", "Added", "Net PnL", "Closing Capital", "% Change", "Trades"]
+        
+        updated = False
+        if file_exists:
+            with open(CAPITAL_HISTORY_FILE, "r", newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, header)
+                for r in reader:
+                    if r and r[0] == now_str:
+                        # ⚠️ FIX: Upate (don't accumulate) because session_net_pnl is already the Daily Total
+                        prev_initial = float(r[1])
+                        prev_added = float(r[2])
+                        
+                        new_pnl = float(session_net_pnl)
+                        new_trades = int(session_trades)
+                        new_closing = round(prev_initial + prev_added + new_pnl, 2)
+                        
+                        base_for_pct = prev_initial + prev_added
+                        new_pct = round((new_pnl / base_for_pct) * 100, 2) if base_for_pct != 0 else 0.0
+                        
+                        rows.append([now_str, prev_initial, prev_added, new_pnl, new_closing, new_pct, new_trades])
+                        updated = True
+                    else:
+                        rows.append(r)
+        
+        if not updated:
+            # New entry for today
+            row_data = [now_str, session_initial_cap, 0, session_net_pnl, session_closing_cap, session_pct_change, session_trades]
+            rows.append(row_data)
+            
+        with open(CAPITAL_HISTORY_FILE, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerows(rows)
+            
+        eod_saved_today = True
+        log_with_callback(log_cb, f"🏁 Capital History Updated: Today's Net {new_pnl:+.2f} ({new_pct:+.2f}%)" if updated else f"🏁 Capital History Initialized: {session_closing_cap:.2f}")
+    except Exception as e:
+        log_with_callback(log_cb, f"⚠️ Save Error: {e}")
+
+def on_closing():
+    if messagebox.askokcancel("Quit", "Do you want to quit? (Capital will be saved)"):
+        try:
+            completed = pnl_engine.completed_trades
+            net = round(sum(t["net_pnl"] for t in completed), 2)
+            cur_cap = pnl_engine.get_current_capital()
+            pct_pnl = pnl_engine.get_pnl_percentage()
+            trades_count = len(completed)
+            
+            # Save if not already saved today
+            if not eod_saved_today:
+                save_capital_to_csv(pnl_engine.initial_capital, net, cur_cap, pct_pnl, trades_count)
+            
+            # Prepare Exit Summary Message
+            overall_pct = get_overall_pnl_summary(net)
+            summary_msg = (
+                f"🏁 *NeoScalper Session Closed*\n\n"
+                f"📅 Date: {datetime.now().strftime('%Y-%m-%d')}\n"
+                f"🔢 Trades: {trades_count}\n"
+                f"💰 Net PnL: {net:+.2f}\n"
+                f"🏦 Capital: {cur_cap:.2f}\n"
+                f"📊 Day %: {pct_pnl:+.2f}%\n"
+                f"📈 Overall %: {overall_pct:+.2f}%"
+            )
+            # Send synchronously to ensure it goes out before app terminates
+            send_telegram_msg(summary_msg)
+        except Exception as e:
+            print(f"Error during on_closing: {e}")
+        root.destroy()
+
+root.protocol("WM_DELETE_WINDOW", on_closing)
 
 # ---------------------------------------------------------
 # MAIN LAYOUT
@@ -182,20 +311,66 @@ def get_underlying_index(symbol: str):
             return "Nifty Bank", "nse_cm", "BANKNIFTY"
         elif "FIN" in s:
             return "Nifty Fin Services", "nse_cm", "FINNIFTY"
-        return "Nifty 50", "nse_cm", "NIFTY_50"
+        return "Nifty 50", "nse_cm", "NIFTY"
     elif "SENSEX" in s or "BSX" in s:
         return "SENSEX", "bse_cm", "SENSEX"
     elif "BANKEX" in s:
-        return "BSE100", "bse_cm", "BANKEX"
+        return "BANKEX", "bse_cm", "BANKEX"
     return None, None, None
 
-def update_auto_strike(idx_ltp: float, idx_name: str):
+
+def parse_symbol_parts(symbol: str):
+    """
+    Robustly parses a symbol like NIFTY2621725600CE into parts.
+    Handles variable length expiry (5 or 6 digits) correctly.
+    Returns: (base, expiry, strike, opt_type) or None
+    """
+    s = symbol.strip().upper()
+    
+    # Try 6-digit match first (Greedy)
+    m = re.search(r'^([A-Z]+?)([0-9]{6})(\d+)(CE|PE)$', s)
+    if m:
+        base, expiry, strike, opt_type = m.groups()
+        # Validate Expiry: YYMMDD
+        try:
+            mm = int(expiry[2:4])
+            dd = int(expiry[4:6])
+            if 1 <= mm <= 12 and 1 <= dd <= 31:
+                return base, expiry, int(strike), opt_type
+        except:
+            pass
+            
+    # Try 5-character match (2 digits + 3 letters for Monthly) 
+    # Example: NIFTY26FEB... -> 26 (Year) + FEB (Month)
+    m = re.search(r'^([A-Z]+?)([0-9]{2}[A-Z]{3})(\d+)(CE|PE)$', s)
+    if m:
+        base, expiry, strike, opt_type = m.groups()
+        return base, expiry, int(strike), opt_type
+
+    # Try 5-digit match (Fallback for weekly)
+    m = re.search(r'^([A-Z]+?)([0-9]{5})(\d+)(CE|PE)$', s)
+    if m:
+        base, expiry, strike, opt_type = m.groups()
+        return base, expiry, int(strike), opt_type
+        
+    return None
+
+def update_auto_strike(idx_ltp: float, idx_name: str, signal: str = None, opt_type_override: str = None):
     """Calculates ATM strike, applies offset, and updates UI symbol."""
-    if not auto_strike_var.get() or buy_active: 
-        return # Skip if manual mode or in a trade
+    global last_logged_strike
+    
+    is_base_index = cur_sym in ["NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY", "BANKEX", "NIFTY_50"] if 'cur_sym' in locals() else False
+    # Re-fetch cur_sym to be safe
+    cur_sym = tr_symbol.get().strip().upper()
+    is_base_index = cur_sym in ["NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY", "BANKEX", "NIFTY_50"]
+
+    if not auto_strike_var.get(): return
+    if buy_active and not is_base_index:
+        return # Skip if already in an active option trade
         
     cur_sym = tr_symbol.get().strip().upper()
     if not cur_sym: return
+    # print(f"DEBUG: Current Symbol in UI: '{cur_sym}'")
     
     # 1. Detect Strike Step
     strike_step = detect_strike_step(cur_sym)
@@ -203,27 +378,91 @@ def update_auto_strike(idx_ltp: float, idx_name: str):
     # 2. Calculate ATM
     atm = round(idx_ltp / strike_step) * strike_step
     
-    # 3. Apply Offset
-    offset_str = strike_offset_var.get() # e.g. "ATM-1", "ATM", "ATM+1"
+    # 3. Parse Offset
+    offset_str = strike_offset_var.get().replace(" ", "") # e.g. "ATM -1" -> "ATM-1"
     offset_val = 0
     if "+" in offset_str:
-        offset_val = int(offset_str.split("+")[1])
+        try: offset_val = int(offset_str.split("+")[1])
+        except: offset_val = 0
     elif "-" in offset_str:
-        offset_val = -int(offset_str.split("-")[1])
-        
-    final_strike = int(atm + (offset_val * strike_step))
+        try: offset_val = -int(offset_str.split("-")[1])
+        except: offset_val = 0
     
-    # 4. Check if we actually need to change it
-    m = re.search(r"(\d+)(CE|PE)?$", cur_sym)
-    if m:
-        cur_strike = int(m.group(1))
+    # 4. Handle Index-to-Option Bootstrapping
+    if cur_sym in ["NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY", "BANKEX", "NIFTY_50"]:
+        # Use the manual CE/PE selector from UI if provided
+        opt_type_val = opt_type_override if opt_type_override in ["CE", "PE"] else None
+        
+        # If not provided via parameter, use signal as fallback
+        if not opt_type_val:
+            opt_type_val = "CE"
+            if signal and "BEARISH" in signal: 
+                opt_type_val = "PE"
+        
+        # Apply offset based on option type
+        # For CE: ATM+1 = strike above ATM (OTM for calls)
+        # For PE: ATM+1 = strike below ATM (OTM for puts)
+        if opt_type_val == "CE":
+            final_strike = int(atm + (offset_val * strike_step))
+        else:  # PE
+            final_strike = int(atm - (offset_val * strike_step))
+        
+        expiry_str = get_next_expiry(cur_sym.replace('NIFTY_50', 'NIFTY'))
+        new_symbol = f"{cur_sym.replace('NIFTY_50', 'NIFTY')}{expiry_str}{final_strike}{opt_type_val}"
+        print(f"DEBUG: Bootstrapping Index {cur_sym} -> Full Symbol: {new_symbol} (ATM: {atm}, Offset: {offset_val}, Type: {opt_type_val})")
+        
+        # Update both symbol and opt_type UI variable
+        def update_ui():
+            tr_symbol.set(new_symbol)
+            try:
+                opt_type.set(opt_type_val)
+            except:
+                pass  # opt_type might not be initialized yet
+            print(f"DEBUG: Applied tr_symbol.set({new_symbol})")
+        
+        root.after(0, update_ui)
+        # Only log if strike changed
+        if last_logged_strike != final_strike:
+            log_with_callback(log_cb, f"🎯 Dynamic Load: {cur_sym} -> {new_symbol} (@{idx_ltp})")
+            last_logged_strike = final_strike
+        return
+
+    # 5. Check if we actually need to change an existing option symbol's strike
+    # Match format: BASE + 5-or-6-digit EXPIRY + STRIKE + CE/PE
+    # Example: SENSEX2621284500CE -> expiry is 26212(5) or 260217(6)
+    parts = parse_symbol_parts(cur_sym)
+    if parts:
+        base, expiry, cur_strike, cur_opt_type = parts
+        
+        # Apply offset based on option type
+        if cur_opt_type == "CE":
+            final_strike = int(atm + (offset_val * strike_step))
+        else:  # PE
+            final_strike = int(atm - (offset_val * strike_step))
+        
         if cur_strike != final_strike:
             new_symbol = update_symbol_strike(cur_sym, final_strike)
-            tr_symbol.set(new_symbol)
-            log_with_callback(log_cb, f"⚡ Auto-Strike: {idx_name} @ {idx_ltp} -> {final_strike}")
+            # print(f"\n⚡ Auto-Strike: Switching {cur_strike} -> {final_strike} for {new_symbol} (Type: {cur_opt_type})")
+            root.after(0, lambda: tr_symbol.set(new_symbol))
+            # Only log if strike changed
+            if last_logged_strike != final_strike:
+                log_with_callback(log_cb, f"⚡ Auto-Strike: {final_strike} (@{idx_ltp})")
+                last_logged_strike = final_strike
+
 
 def update_symbol_strike(symbol: str, new_strike: int) -> str:
+    """Updates the strike price in an option symbol while preserving expiry.
+    Format: NIFTY2621725950CE -> NIFTY26217{NEW_STRIKE}CE
+    """
     s = symbol.strip().upper()
+    
+    # Match: BASE + 5-or-6-digit EXPIRY + STRIKE + CE/PE
+    parts = parse_symbol_parts(s)
+    if parts:
+        base, expiry, old_strike, opt_type = parts
+        return f"{base}{expiry}{new_strike}{opt_type}"
+    
+    # Fallback for symbols without expiry (legacy format)
     m = re.search(r"(\d+)(CE|PE)?$", s)
     if not m:
         return s
@@ -239,6 +478,8 @@ def update_symbol_option(symbol: str, new_type: str) -> str:
 
 def update_params_by_symbol(*args):
     """Updates Target, SL, TSL, and PT based on the index of the symbol."""
+    global last_logged_params_symbol
+    
     cur_sym = tr_symbol.get().strip().upper()
     if not cur_sym: return
     
@@ -253,39 +494,13 @@ def update_params_by_symbol(*args):
         sl_var.set(str(config["sl"]))
         trail_var.set(str(config["tsl"]))
         pt_var.set(str(config["pt"]))
-        log_with_callback(log_cb, f"⚙️ Params updated for {cur_sym}")
+        # Only log if symbol changed (to avoid spam when strike updates)
+        if last_logged_params_symbol != cur_sym:
+            log_with_callback(log_cb, f"⚙️ Params updated for {cur_sym}")
+            last_logged_params_symbol = cur_sym
 
 
-def load_history():
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r") as f:
-                return json.load(f)
-        except:
-            pass
-    return []
-
-def save_history(history):
-    try:
-        with open(HISTORY_FILE, "w") as f:
-            json.dump(history, f)
-    except:
-        pass
-
-def update_history(event=None):
-    new_val = tr_symbol.get().strip().upper()
-    if not new_val: return
-    
-    current = list(symbol_combo["values"])
-    if new_val in current:
-        current.remove(new_val)
-    
-    current.insert(0, new_val)
-    current = current[:3]
-    
-    symbol_combo["values"] = current
-    save_history(current)
-    log_with_callback(log_cb, f"History updated: {new_val}")
+# Symbol history removed - using static list instead
 
 # 1️⃣ STRIKE UNIT (Row 0)
 ttk.Label(frm, text="Strike:").grid(row=0, column=0, sticky="e", pady=5, padx=5)
@@ -293,9 +508,10 @@ ttk.Label(frm, text="Strike:").grid(row=0, column=0, sticky="e", pady=5, padx=5)
 def move_strike(step):
     cur_sym = tr_symbol.get().strip().upper()
     if not cur_sym: return
-    m = re.search(r"(\d+)(CE|PE)?$", cur_sym)
-    if not m: return
-    cur_strike = int(m.group(1))
+    # Match format: BASE + 5-or-6-digit EXPIRY + STRIKE + CE/PE
+    parts = parse_symbol_parts(cur_sym)
+    if not parts: return
+    base, expiry, cur_strike, opt_type = parts
     strike_step = int(detect_strike_step(cur_sym))
     new_strike = cur_strike + (strike_step * step)
     if new_strike <= 0: return
@@ -308,12 +524,26 @@ updown.grid(row=0, column=1, columnspan=5, sticky="w", pady=5)
 ttk.Button(updown, text="▲", width=3, command=lambda: move_strike(1)).pack(side="left", padx=1)
 ttk.Button(updown, text="▼", width=3, command=lambda: move_strike(-1)).pack(side="left", padx=1)
 
-auto_strike_var = tk.BooleanVar(value=False)
+auto_strike_var = tk.BooleanVar(value=True)
 ttk.Checkbutton(updown, text="Auto", variable=auto_strike_var).pack(side="left", padx=(10, 2))
 
 strike_offset_var = tk.StringVar(value="ATM")
-offset_combo = ttk.Combobox(updown, textvariable=strike_offset_var, values=["ATM-3", "ATM-2", "ATM-1", "ATM", "ATM+1", "ATM+2", "ATM+3"], width=6, state="readonly")
+offset_combo = ttk.Combobox(updown, textvariable=strike_offset_var, 
+                            values=[f"ATM {i:+d}" if i != 0 else "ATM" for i in range(-10, 11)], 
+                            width=8, state="readonly")
 offset_combo.pack(side="left", padx=2)
+
+def on_offset_change(*args):
+    if auto_strike_var.get() and last_idx_ltp > 0:
+        # Trigger an immediate update since the user changed the offset
+        try:
+            current_sig = scalp_manager.get_signal().get('signal')
+            current_opt_type = opt_type.get() if 'opt_type' in globals() else None
+            update_auto_strike(last_idx_ltp, last_idx_name, signal=current_sig, opt_type_override=current_opt_type)
+        except Exception as e:
+            print(f"DEBUG: Error in immediate offset update: {e}")
+
+strike_offset_var.trace_add("write", on_offset_change)
 
 ttk.Button(updown, text="RESET", width=8, command=lambda: trigger_override()).pack(side="left", padx=(20, 2))
 
@@ -328,6 +558,14 @@ def toggle_cepe():
     if cur:
         tr_symbol.set(update_symbol_option(cur, new))
         log_with_callback(log_cb, f"Updated Option: {new}")
+    
+    # If auto-strike is enabled, trigger immediate update with new option type
+    if auto_strike_var.get() and last_idx_ltp > 0:
+        try:
+            current_sig = scalp_manager.get_signal().get('signal')
+            update_auto_strike(last_idx_ltp, last_idx_name, signal=current_sig, opt_type_override=new)
+        except Exception as e:
+            print(f"DEBUG: Error in CE/PE toggle update: {e}")
 
 opt_type = tk.StringVar(value="CE")
 cepe_btn = ttk.Button(frm, text="CE", width=12, style="CE.TButton", command=toggle_cepe)
@@ -361,10 +599,8 @@ ttk.Entry(param_frame, textvariable=pt_var, width=5).pack(side="left", padx=2)
 ttk.Label(frm, text="Symbol:").grid(row=3, column=0, sticky="e", pady=5, padx=5)
 tr_symbol = tk.StringVar(value=DEFAULT_TRADING_SYMBOL)
 tr_symbol.trace_add("write", update_params_by_symbol)
-history = load_history()
-symbol_combo = ttk.Combobox(frm, textvariable=tr_symbol, values=history, width=32)
+symbol_combo = ttk.Combobox(frm, textvariable=tr_symbol, values=["NIFTY", "SENSEX"], width=32, state="readonly")
 symbol_combo.grid(row=3, column=1, columnspan=5, sticky="w", pady=5)
-symbol_combo.bind("<Return>", update_history)
 
 # 5️⃣ CONTROL BUTTONS (Row 4)
 btn_frame = ttk.Frame(frm)
@@ -407,6 +643,10 @@ position_label.pack(side="left", padx=(20, 0))
 strategy_status_label = ttk.Label(status_frame, text="Strategy: Waiting...", font=("Segoe UI", 10, "bold"))
 strategy_status_label.pack(side="right", padx=(0, 5))
 
+# High Momentum Alert Label
+momentum_alert_label = tk.Label(status_frame, text="", font=("Segoe UI", 10, "bold"), bg=root.cget('bg'))
+momentum_alert_label.pack(side="right", padx=(0, 20))
+
 # ---------------------------------------------------------
 # LOGIC
 # ---------------------------------------------------------
@@ -443,13 +683,14 @@ def trigger_override():
             reason = data.get("last_trade_id")
             rem = data.get("disabled_until", 0) - time.time()
             # If it's a 24-hour lockout (Hard Stop)
-            if reason == "max_loss" or (reason.startswith("max_loss") and rem > 80000):
+            if reason == "max_loss" or (reason and str(reason).startswith("max_loss") and rem > 80000):
                 today = datetime.now().strftime("%Y-%m-%d")
                 if data.get("date") == today:
                     log_with_callback(log_cb, "⛔ HARD STOP: Max Loss limit reached. Cannot override until tomorrow.")
                     messagebox.showerror("Hard Stop", "Max Loss limit reached. Trading is disabled for the rest of the day.")
                     return
-        except: pass
+        except Exception as e:
+            log_with_callback(log_cb, f"DEBUG: Error checking override: {e}")
 
     if os.path.exists(BUY_DISABLED_FILE):
         try:
@@ -499,6 +740,7 @@ def update_status_label():
     disabled, remaining, reason = is_buy_disabled()
     if disabled:
         buy_btn.config(state="disabled")
+        buy_btn.config(style="Locked.TButton")
         if reason.startswith("max_loss"):
             # A "Hard Stop" is defined as a lockout of 24 hours (1440 mins) or more
             # We use 86000 as a buffer for 86400 seconds (24h)
@@ -513,6 +755,8 @@ def update_status_label():
                 status_label.config(text=f"Buy Disabled - Loss Limit ({mins}:{secs:02d})", foreground="red")
         elif reason == "max_profit":
             status_label.config(text="Buy Disabled - Max Profit Reached", foreground="green")
+        elif reason == "max_loss_count":
+            status_label.config(text=f"Buy Disabled - Max Losses ({MAX_DAILY_LOSS_COUNT})", foreground="red")
         else:
             mins = int(remaining // 60)
             secs = int(remaining % 60)
@@ -758,7 +1002,9 @@ def do_buy(trade_type="Manual"):
     tgt_price = round(last_buy_price + tgt_pts, 2)
     sl_price = round(last_buy_price - sl_pts, 2)
 
-    log_with_callback(log_cb, f"🎯 Confirmed BUY Executed @ {last_buy_price}")
+    log_with_callback(log_cb, f"🎯 Confirmed BUY Executed @ {last_buy_price}") 
+    # Telegram Notification Removed per User Request
+
     log_with_callback(log_cb, f"📊 Target: {tgt_price} (+{tgt_pts}) | SL: {sl_price} (-{sl_pts})")
     log_with_callback(log_cb, f"✅ BUY completed - waiting for SELL")
 
@@ -876,6 +1122,8 @@ def do_exit(reason="Manual"):
     if reason != "Manual":
         log_msg += f" [{reason}]"
     log_with_callback(log_cb, log_msg)
+    # Telegram Notification Removed per User Request
+    
     log_with_callback(log_cb, "✅ POSITION CLOSED")
 
 
@@ -890,7 +1138,7 @@ def color_pnl(val):
 
 def update_monitor_ui():
     """Background worker to fetch and process PnL data."""
-    global pnl_engine, active_symbol, last_buy_price, max_price_seen, buy_active, last_trade_count, active_trade_metadata
+    global pnl_engine, active_symbol, last_buy_price, max_price_seen, buy_active, last_trade_count, active_trade_metadata, last_mom_alert_time, mom_threshold_start
     try:
         client = get_client()
         if not client:
@@ -910,7 +1158,20 @@ def update_monitor_ui():
                     qty = int(float(p.get("netQty", fl_buy - fl_sell)))
                     
                     if qty != 0:
-                        has_open_pos = True
+                        # Only count as 'buy_active' if it's a relevant Index/FO position
+                        sym_p = p.get("trdSym", "").upper()
+                        exch_p = p.get("exch", "").lower()
+                        
+                        # Exclude equity positions (ending with -EQ)
+                        if "-EQ" in sym_p:
+                            continue
+                        
+                        # Only count FO positions or index derivatives
+                        if "fo" in exch_p or any(x in sym_p for x in ["NIFTY", "SENSEX", "BANKNIFTY", "FINNIFTY", "BANKEX"]):
+                            # Additional check: must not be an equity ETF
+                            if "BEES" not in sym_p and "ETF" not in sym_p:
+                                has_open_pos = True
+                                print(f"DEBUG: Active FO Position found: {sym_p} ({qty})")
                         # 🛡️ AUTO-RECOVERY from positions API (Source of Truth)
                         if not active_symbol or last_buy_price <= 0:
                              active_symbol = p.get("trdSym", "").upper()
@@ -1006,10 +1267,24 @@ def update_monitor_ui():
                     elif "ltp" in quote_resp:
                         idx_ltp = float(quote_resp.get("ltp", 0))
                 
+                # Update terminal with live LTP
+                # Update terminal with live LTP
+                debug_msg = f"DEBUG: UI SYMBOL: {tr_current_ui} | INDEX {idx_name}: {idx_ltp} | ACTIVE: {buy_active}"
+                print(f"{debug_msg}{' ' * (80 - len(debug_msg))}", end='\r', flush=True)
+
                 if idx_ltp > 0:
+                    global last_idx_ltp, last_idx_name
+                    last_idx_ltp = idx_ltp
+                    last_idx_name = idx_name
+                    
                     scalp_manager.add_ltp(idx_ltp, idx_name)
                     # 🚀 AUTO STRIKE SELECTION
-                    update_auto_strike(idx_ltp, idx_name)
+                    current_sig = scalp_manager.get_signal().get('signal')
+                    try:
+                        current_opt_type = opt_type.get()
+                    except:
+                        current_opt_type = None  # opt_type not initialized yet
+                    update_auto_strike(idx_ltp, idx_name, signal=current_sig, opt_type_override=current_opt_type)
                 else:
                     log_with_callback(log_cb, f"⚠️ Warning: Index fetch for {idx_name} returned 0. Using fallback.")
             except Exception as e:
@@ -1042,7 +1317,7 @@ def update_monitor_ui():
         # 🎯 CAPITAL CALCULATION
         cur_cap = pnl_engine.get_current_capital()
         pct_pnl = pnl_engine.get_pnl_percentage()
-        m_pnl = get_monthly_pnl_summary(net)
+        o_pnl_pct = get_overall_pnl_summary(net)
 
         lines = [
             f"Trades: {len(completed)}",
@@ -1054,9 +1329,11 @@ def update_monitor_ui():
             "-" * 20,
             f"Capital  : {cur_cap:.2f}",
             f"PnL %    : {pct_pnl:+.2f}%",
-            f"Month PnL: {m_pnl:+.2f}",
+            f"Overall PnL %: {o_pnl_pct:+.2f}%",
             "-" * 20,
             f"RSI: {indicator_data.get('rsi', 0)} | Mom: {indicator_data.get('momentum', 0)}",
+            f"Res: {indicator_data.get('sr', {}).get('resistance', 0)} | Sup: {indicator_data.get('sr', {}).get('support', 0)}",
+            f"H/L: {indicator_data.get('sr', {}).get('day_high', 0)} / {indicator_data.get('sr', {}).get('day_low', 0)}",
             f"Recent: {last_str}"
         ]
         
@@ -1073,25 +1350,7 @@ def update_monitor_ui():
         now = datetime.now()
         # Save EOD Capital at 3:30 PM (15:30)
         if now.hour == 15 and now.minute >= 30 and not eod_saved_today:
-            try:
-                row = {
-                    "Date": now.strftime("%Y-%m-%d"), 
-                    "Initial Capital": pnl_engine.initial_capital, 
-                    "Net PnL": net, 
-                    "Closing Capital": cur_cap, 
-                    "% Change": pct_pnl,
-                    "Trades": len(completed)
-                }
-                file_exists = os.path.exists(CAPITAL_HISTORY_FILE)
-                with open(CAPITAL_HISTORY_FILE, "a", newline="") as f:
-                    import csv
-                    writer = csv.DictWriter(f, fieldnames=row.keys())
-                    if not file_exists: writer.writeheader()
-                    writer.writerow(row)
-                eod_saved_today = True
-                log_with_callback(log_cb, f"🏁 EOD Capital Saved: {cur_cap:.2f} ({pct_pnl:+.2f}%) | Trades: {len(completed)}")
-            except Exception as ee:
-                log_with_callback(log_cb, f"⚠️ EOD Save Error: {ee}")
+            save_capital_to_csv(pnl_engine.initial_capital, net, cur_cap, pct_pnl, len(completed))
         elif now.hour < 9: # Reset for new day
             eod_saved_today = False
 
@@ -1105,7 +1364,7 @@ def update_monitor_ui():
             trade_status = "⚠️ MARKET EXHAUSTED"
             trade_color = "#ef4444" # Red
         elif market_sideways:
-            trade_status = "⏸️ MARKET SIDEWAYS"
+            trade_status = f"⏸️ SIDEWAYS (RSI:{indicator_data.get('rsi')} / Mtm:{indicator_data.get('momentum')})"
             trade_color = "#f97316" # Orange
         elif sig == "NEUTRAL":
             trade_status = f"⚖️ NEUTRAL (RSI:{indicator_data.get('rsi')} / Tgt:{RSIM_RSI_UP}|{RSIM_RSI_DOWN})"
@@ -1128,7 +1387,7 @@ def update_monitor_ui():
             trade_color = "#3b82f6" # Bright Blue
 
         # 🎯 AUTOMATIC TARGET EXIT LOGIC
-        if buy_active and not exit_pending:
+        if auto_sell and buy_active and not exit_pending:
             cur_ltp = 0
             
             # 🛡️ RECOVER STATE if buy_active is true but we lost the price/symbol
@@ -1142,7 +1401,8 @@ def update_monitor_ui():
                         break
 
             if last_buy_price <= 0:
-                log_with_callback(log_cb, "⚠️ Warning: Position active but entry price is 0. Exit logic skipped.")
+                #log_with_callback(log_cb, "⚠️ Warning: Position active but entry price is 0. Exit logic skipped.")
+                time.sleep(1)
             else:
                 try:
                     # Check price of the symbols we bought
@@ -1215,6 +1475,32 @@ def update_monitor_ui():
         # Update Scalper UI Strategy Label
         root.after(0, lambda: strategy_status_label.config(text=f"Strategy: {trade_status}", foreground=trade_color))
 
+        # ⚡ HIGH MOMENTUM FLASH ALERT
+        mom_val = indicator_data.get('momentum', 0)
+        if abs(mom_val) >= 20:
+            if mom_threshold_start == 0:
+                mom_threshold_start = time.time()
+            
+            # SUSTAIN check
+            if time.time() - mom_threshold_start >= 4:
+                # Alternating red shades for a "flash" effect when UI refreshes
+                flash_color = "#ef4444" if (int(time.time() * 2) % 2 == 0) else "#b91c1c"
+                root.after(0, lambda m=mom_val, c=flash_color: momentum_alert_label.config(
+                    text=f" 🔥 {m:+.2f} 🔥 ", fg="white", bg=c
+                ))
+                
+                # 📢 TELEGRAM ALERT (1-min cooldown)
+                if time.time() - last_mom_alert_time > TELEGRAM_COOL_OFF: 
+                    last_mom_alert_time = time.time()
+                    direction = "🚀 BULLISH SURGE" if mom_val > 0 else "📉 BEARISH CRASH"
+                    alert_msg = f"⚡ **\n\nIndex: {idx_name or tr_for_quote}\nDirection: {direction}\nValue: {mom_val:+.2f}\nLTP: {idx_ltp if idx_ltp > 0 else 'N/A'}"
+                    run_bg(send_telegram_msg, alert_msg)
+            else:
+                root.after(0, lambda: momentum_alert_label.config(text="", bg=root.cget('bg')))
+        else:
+            mom_threshold_start = 0
+            root.after(0, lambda: momentum_alert_label.config(text="", bg=root.cget('bg')))
+
         # 🤖 AUTO MODE LOGIC
         if auto_buy and not buy_active and not buy_pending:
             tr = tr_symbol.get().strip().upper()
@@ -1226,10 +1512,33 @@ def update_monitor_ui():
             
             if sig == "BULLISH":
                 if is_ce: should_buy = True
-                elif is_pe: mismatch_msg = "Market is BULLISH, but a PUT (PE) is selected. Skipping..."
+                elif is_pe: 
+                    log_with_callback(log_cb, "🤖 AUTO: Switching to CE for BULLISH signal...")
+                    def _switch_to_ce():
+                        try:
+                            opt_type.set("CE")
+                            cepe_btn.config(text="CE", style="CE.TButton")
+                            tr_symbol.set(update_symbol_option(tr, "CE"))
+                            if auto_strike_var.get():
+                                update_auto_strike(last_idx_ltp, last_idx_name, signal="BULLISH", opt_type_override="CE")
+                        except: pass
+                    root.after(0, _switch_to_ce)
+                    return # Wait for next tick to buy
+                    
             elif sig == "BEARISH":
                 if is_pe: should_buy = True
-                elif is_ce: mismatch_msg = "Market is BEARISH, but a CALL (CE) is selected. Skipping..."
+                elif is_ce: 
+                    log_with_callback(log_cb, "🤖 AUTO: Switching to PE for BEARISH signal...")
+                    def _switch_to_pe():
+                        try:
+                            opt_type.set("PE")
+                            cepe_btn.config(text="PE", style="PE.TButton")
+                            tr_symbol.set(update_symbol_option(tr, "PE"))
+                            if auto_strike_var.get():
+                                update_auto_strike(last_idx_ltp, last_idx_name, signal="BEARISH", opt_type_override="PE")
+                        except: pass
+                    root.after(0, _switch_to_pe)
+                    return # Wait for next tick to buy
 
             if should_buy:
                 # Check if buy is actually allowed (not disabled)
@@ -1310,8 +1619,8 @@ def process_buy_disable_logic(engine):
             break
             
     # Handle Recovery: If we improved below the highest threshold hit earlier
-    # We only clear if we are NOT in a Hard Stop zone (>= 2501)
-    if highest_threshold_hit > 0 and highest_threshold_hit < 2501 and app_t < highest_threshold_hit:
+    # We allow clearing even if we were in a Hard Stop zone, provided current loss is lower than peak
+    if highest_threshold_hit > 0 and app_t < highest_threshold_hit:
         if current_label != "recovery":
             log_with_callback(log_cb, f"📈 Recovery Detected: Net Loss {loss_amount:.0f} improved below {highest_threshold_hit}.")
             with open(BUY_DISABLED_FILE, 'w') as f:
@@ -1352,6 +1661,21 @@ def process_buy_disable_logic(engine):
                      "highest_threshold": highest_threshold_hit
                  }, f)
              log_with_callback(log_cb, f"SUCCESS: Net Profit {net_pnl} exceeds limit {BUY_DISABLE_MAX_PROFIT}. Buy disabled until tomorrow.")
+        return
+
+    # 2.5 Check for Total Daily Loss Count Hard Stop
+    daily_losses = [t for t in completed if t.get("net_pnl", 0) < 0]
+    if len(daily_losses) >= MAX_DAILY_LOSS_COUNT:
+        if current_label != "max_loss_count":
+            disabled_until_ts = time.time() + 86400 # 24 hours
+            with open(BUY_DISABLED_FILE, 'w') as f:
+                json.dump({
+                    "disabled_until": disabled_until_ts, 
+                    "last_trade_id": "max_loss_count", 
+                    "date": today_str,
+                    "highest_threshold": highest_threshold_hit
+                }, f)
+            log_with_callback(log_cb, f"⚠️ HARD STOP: Total daily loss count {len(daily_losses)} reached limit {MAX_DAILY_LOSS_COUNT}. Buy disabled until tomorrow.")
         return
 
     # 3. Check for NEW Consecutive Loss Lockout
@@ -1497,10 +1821,10 @@ def render_monitor_display(lines, net_val, gross_val):
             tag = None
             if line.startswith("Net"): tag = "green" if net_val > 0 else "red"
             elif line.startswith("Gross"): tag = "green" if gross_val > 0 else "red"
-            elif line.startswith("Month PnL"):
+            elif line.startswith("Overall PnL %"):
                 try:
-                    m_val = float(line.split(": ")[1])
-                    tag = "green" if m_val > 0 else "red" if m_val < 0 else None
+                    o_val = float(line.split(": ")[1].replace("%", ""))
+                    tag = "green" if o_val > 0 else "red" if o_val < 0 else None
                 except: tag = None
             elif "Allowed to Trade" in line: tag = "green"
             elif "Dont Trade" in line: tag = "red"
@@ -1519,13 +1843,31 @@ def startup_sequence():
     try:
         do_login(log_cb)
         load_scrip_master_csv(log_cb=log_cb)
+        load_scrip_master_csv(log_cb=log_cb)
         log_with_callback(log_cb, "✅ Startup Complete")
+        
+        # Prepare Startup Message with Capital info
+        startup_msg = "🚀 *NeoScalper Bot Initialized*\nWaiting for market data..."
+        if os.path.exists(CAPITAL_HISTORY_FILE):
+            try:
+                df = pd.read_csv(CAPITAL_HISTORY_FILE)
+                if not df.empty:
+                    last_row = df.iloc[-1]
+                    startup_msg += f"\n\n📊 *Last Session Summary ({last_row.get('Date', 'N/A')})*\n"
+                    startup_msg += f"Initial: {float(last_row.get('Initial Capital', 0)):.2f}\n" 
+                    startup_msg += f"Net PnL: {float(last_row.get('Net PnL', 0)):.2f}\n"
+                    startup_msg += f"Closing: {float(last_row.get('Closing Capital', 0)):.2f}"
+            except Exception as e:
+                log_with_callback(log_cb, f"Error reading capital history for telegram: {e}")
+
+        run_bg(send_telegram_msg, startup_msg)
         
         # Start Monitor First Run
         root.after(2000, lambda: run_bg(update_monitor_ui))
         
     except Exception as e:
-        log_with_callback(log_cb, f"❌ Startup Failed: {e}")
+        err_msg = str(e) if str(e) is not None else repr(e)
+        log_with_callback(log_cb, f"❌ Startup Failed: {err_msg}")
 
 root.after(500, lambda: run_bg(startup_sequence))
 update_status_label()
