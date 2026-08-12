@@ -116,7 +116,7 @@ def parse_api_orders(api_data: List[dict]) -> List[Trade]:
 
     for o in api_data:
         # DBG: Print full order object to finding source field
-        if o == api_data[0]: print(f"DEBUG: Order Object Structure: {o}")
+        # if o == api_data[0]: print(f"DEBUG: Order Object Structure: {o}")
         raw_status = str(o.get("ordSt", ""))
         status = raw_status.lower()
         if status not in ["complete", "completed", "filled"]:

@@ -10,11 +10,11 @@ import os
 # Allow importing from parent directory
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from common.config import DEFAULT_TRADING_SYMBOL, BUY_DISABLE_DURATION, BUY_DISABLE_LOSS_COUNT, BUY_DISABLE_MAX_LOSS, BUY_DISABLE_MAX_PROFIT, PROGRESSIVE_LOSS_CONFIG, PROGRESSIVE_LOSS_CONFIG_DEFAULT, REFRESH_INTERVAL_MS, DEFAULT_TARGET, DEFAULT_SL, DEFAULT_TSL_STEP, DEFAULT_TP_TSL, COOL_OFF_PERIOD, REMOTE_CONFIG_URL, PROGRESSIVE_LOSS_URL, NIFTY_CONFIG, SENSEX_CONFIG, INITIAL_CAPITAL, CAPITAL_HISTORY_FILE, CAPITAL_TOPUP
+from common.config import DEFAULT_TRADING_SYMBOL, BUY_DISABLE_DURATION, BUY_DISABLE_LOSS_COUNT, BUY_DISABLE_MAX_LOSS, BUY_DISABLE_MAX_PROFIT, PROGRESSIVE_LOSS_CONFIG, PROGRESSIVE_LOSS_CONFIG_DEFAULT, REFRESH_INTERVAL_MS, DEFAULT_TARGET, DEFAULT_SL, DEFAULT_TSL_STEP, DEFAULT_TP_TSL, COOL_OFF_PERIOD, REMOTE_CONFIG_URL, PROGRESSIVE_LOSS_URL, NIFTY_CONFIG, SENSEX_CONFIG, INITIAL_CAPITAL, CAPITAL_HISTORY_FILE, CAPITAL_TOPUP, RSIM_RSI_UP, RSIM_RSI_DOWN, RSIM_SUSTAIN_TICKS
 from common.utils import log_with_callback, run_bg, fetch_remote_config, fetch_remote_json, get_resource_path
 from common.scrip_master import load_scrip_master_csv, find_token_for_trading_symbol
 from common.orders import ensure_login as do_login, place_market_order, get_client, detect_exchange_segment, detect_strike_step
-from indicator.scalping_indicator import LiveScalpingManager
+from indicator.scalping_indicator import LiveScalpingManager, RSIMomentumStrategy
 from monitor.pnl_engine import PositionPnLEngine, parse_api_orders
 import json
 import time
@@ -37,8 +37,9 @@ active_symbol = ""  # 🏷️ The exact symbol of the current open position
 buy_disabled = False  # Track if buy is disabled due to losses
 last_trade_count = 0 # Track saved trades
 last_display_content = "" # Cache last displayed content to prevent flickering
-scalp_manager = LiveScalpingManager()
-auto_mode = False   # Automated trading status
+scalp_manager = LiveScalpingManager(strategy=RSIMomentumStrategy())
+auto_buy = False    # Automated entry status
+auto_sell = False   # Automated exit status
 last_buy_price = 0.0 # Entry price of current active position
 max_price_seen = 0.0 # Peak price for trailing SL tracking
 active_trade_metadata = {} # Snapshot of indicators at entry/exit
@@ -46,26 +47,40 @@ last_exit_reason = "" # Track last exit reason for logging
 last_exit_time = 0   # ⏱️ Track when the last trade ended for cool-off period
 # Capital & Rollover Initialization
 def get_latest_capital():
+    """Fetches the latest closing capital from history or uses default.
+    If today's EOD was already saved, we use today's Initial Capital to avoid double counting today's orders.
+    """
     base = INITIAL_CAPITAL
     if os.path.exists(CAPITAL_HISTORY_FILE):
         try:
             df = pd.read_csv(CAPITAL_HISTORY_FILE)
             if not df.empty:
-                base = float(df.iloc[-1]["Closing Capital"])
-        except: pass
+                df['Date'] = pd.to_datetime(df['Date']).dt.date
+                today = datetime.now().date()
+                today_entry = df[df['Date'] == today]
+                if not today_entry.empty:
+                    base = float(today_entry.iloc[0]["Initial Capital"])
+                else:
+                    base = float(df.iloc[-1]["Closing Capital"])
+        except Exception as e:
+            print(f"Error reading capital history: {e}")
     return base + CAPITAL_TOPUP
 
 def get_monthly_pnl_summary(current_net_pnl=0.0):
-    """Calculates total net PnL for the current month from history + current session."""
+    """Calculates total net PnL for the current month from history + current session.
+    Filters out today's history entry to avoid double counting with current session.
+    """
     monthly_pnl = current_net_pnl
     if os.path.exists(CAPITAL_HISTORY_FILE):
         try:
             df = pd.read_csv(CAPITAL_HISTORY_FILE)
             if not df.empty:
                 df['Date'] = pd.to_datetime(df['Date'])
-                current_month = datetime.now().month
-                current_year = datetime.now().year
-                mask = (df['Date'].dt.month == current_month) & (df['Date'].dt.year == current_year)
+                now = datetime.now()
+                # Sum Net PNL for current month EXCLUDING today
+                mask = (df['Date'].dt.month == now.month) & \
+                       (df['Date'].dt.year == now.year) & \
+                       (df['Date'].dt.date < now.date())
                 monthly_pnl += df[mask]['Net PnL'].sum()
         except Exception as e:
             print(f"Error calculating monthly PnL: {e}")
@@ -300,6 +315,8 @@ strike_offset_var = tk.StringVar(value="ATM")
 offset_combo = ttk.Combobox(updown, textvariable=strike_offset_var, values=["ATM-3", "ATM-2", "ATM-1", "ATM", "ATM+1", "ATM+2", "ATM+3"], width=6, state="readonly")
 offset_combo.pack(side="left", padx=2)
 
+ttk.Button(updown, text="RESET", width=8, command=lambda: trigger_override()).pack(side="left", padx=(20, 2))
+
 # 2️⃣ OPTION TYPE (Row 1)
 ttk.Label(frm, text="Option:").grid(row=1, column=0, sticky="e", pady=5, padx=5)
 
@@ -364,16 +381,18 @@ ttk.Button(
     command=lambda: run_bg(do_exit)
 ).pack(side="left", padx=10)
 
-ttk.Button(
-    btn_frame, text="RESET", width=12,
-    command=lambda: trigger_override()
-).pack(side="left", padx=10)
 
-auto_btn = ttk.Button(
-    btn_frame, text="AUTO: OFF", width=12, style="Auto.TButton",
-    command=lambda: toggle_auto_mode()
+auto_buy_btn = ttk.Button(
+    btn_frame, text="AUTO BUY: OFF", width=15, style="Auto.TButton",
+    command=lambda: toggle_auto_buy()
 )
-auto_btn.pack(side="left", padx=10)
+auto_buy_btn.pack(side="left", padx=5)
+
+auto_sell_btn = ttk.Button(
+    btn_frame, text="AUTO SELL: OFF", width=15, style="Auto.TButton",
+    command=lambda: toggle_auto_sell()
+)
+auto_sell_btn.pack(side="left", padx=5)
 
 # 5.5️⃣ STATUS BAR (Row 5)
 status_frame = ttk.Frame(frm)
@@ -434,22 +453,45 @@ def trigger_override():
 
     if os.path.exists(BUY_DISABLED_FILE):
         try:
-            os.remove(BUY_DISABLED_FILE)
-            log_with_callback(log_cb, "✅ Manual RESET: Persistent lockout cleared.")
-        except: pass
+            # We want to clear the timer, but KEEP the memory
+            # of highest_threshold AND last_trade_id so we don't re-lock.
+            with open(BUY_DISABLED_FILE, 'r') as f:
+                data = json.load(f)
+            
+            data["disabled_until"] = 0
+            # Keeping data["last_trade_id"] as is prevents 3-loss re-trigger
+            # Keeping data["highest_threshold"] prevents dollar re-trigger
+            
+            with open(BUY_DISABLED_FILE, 'w') as f:
+                json.dump(data, f)
+                
+            log_with_callback(log_cb, "✅ Manual RESET: timer cleared. (Memory preserved).")
+        except: 
+            try: os.remove(BUY_DISABLED_FILE)
+            except: pass
     else:
-        log_with_callback(log_cb, "✅ Manual RESET: Buy enabled (Conditions will be re-checked).")
+        log_with_callback(log_cb, "✅ Manual RESET: Buy enabled.")
     update_status_label()
 
-def toggle_auto_mode():
-    global auto_mode
-    auto_mode = not auto_mode
-    if auto_mode:
-        auto_btn.config(text="AUTO: ON", style="AutoOn.TButton")
-        log_with_callback(log_cb, "🤖 Automated Mode: ENABLED")
+def toggle_auto_buy():
+    global auto_buy
+    auto_buy = not auto_buy
+    if auto_buy:
+        auto_buy_btn.config(text="AUTO BUY: ON", style="AutoOn.TButton")
+        log_with_callback(log_cb, "🤖 Auto Buy: ENABLED")
     else:
-        auto_btn.config(text="AUTO: OFF", style="Auto.TButton")
-        log_with_callback(log_cb, "⭕ Automated Mode: DISABLED")
+        auto_buy_btn.config(text="AUTO BUY: OFF", style="Auto.TButton")
+        log_with_callback(log_cb, "⭕ Auto Buy: DISABLED")
+
+def toggle_auto_sell():
+    global auto_sell
+    auto_sell = not auto_sell
+    if auto_sell:
+        auto_sell_btn.config(text="AUTO SELL: ON", style="AutoOn.TButton")
+        log_with_callback(log_cb, "🤖 Auto Sell: ENABLED")
+    else:
+        auto_sell_btn.config(text="AUTO SELL: OFF", style="Auto.TButton")
+        log_with_callback(log_cb, "⭕ Auto Sell: DISABLED")
 
 
 def update_status_label():
@@ -623,7 +665,7 @@ def do_buy(trade_type="Manual"):
             for attempt in range(6): # 6 attempts * 0.5s = 3s total
                 time.sleep(0.5) 
                 history_resp = client.order_history(order_id=order_id)
-                print(f"DEBUG: Order History Response (BUY) for {order_id}: {history_resp}")
+                # print(f"DEBUG: Order History Response (BUY) for {order_id}: {history_resp}")
                 
                 # Handle both list and dict-with-data formats
                 history = history_resp if isinstance(history_resp, list) else history_resp.get("data", []) if isinstance(history_resp, dict) else []
@@ -776,7 +818,7 @@ def do_exit(reason="Manual"):
             for attempt in range(6): # 6 attempts * 0.5s = 3s total
                 time.sleep(0.5) 
                 history_resp = client.order_history(order_id=order_id)
-                print(f"DEBUG: Order History Response (SELL) for {order_id}: {history_resp}")
+                # print(f"DEBUG: Order History Response (SELL) for {order_id}: {history_resp}")
                 
                 # Handle both list and dict-with-data formats
                 history = history_resp if isinstance(history_resp, list) else history_resp.get("data", []) if isinstance(history_resp, dict) else []
@@ -860,8 +902,7 @@ def update_monitor_ui():
             data = pos_resp.get("data", []) if isinstance(pos_resp, dict) else pos_resp
             has_open_pos = False
             if isinstance(data, list):
-                if data:
-                    print(f"DEBUG: Raw Position Response: {data[0]}")
+                # print(f"DEBUG: Raw Position Response: {data[0]}")
                 for p in data:
                     # 🛡️ BSE FO Fallback: If netQty is missing, calculate from fills
                     fl_buy = float(p.get("flBuyQty", 0))
@@ -943,31 +984,6 @@ def update_monitor_ui():
         
         last_str = " | ".join(str(p) for p in pnls[-5:])
 
-        # 🎯 CAPITAL CALCULATION
-        cur_cap = pnl_engine.get_current_capital()
-        pct_pnl = pnl_engine.get_pnl_percentage()
-        m_pnl = get_monthly_pnl_summary(net)
-
-        lines = [
-            f"Trades: {len(completed)}",
-            f"W/L   : {wins}/{losses} ({win_rate}%)",
-            "-" * 20,
-            f"Gross PnL: {gross}",
-            f"Net PnL  : {net}",
-            f"Charges  : {charges}",
-            "-" * 20,
-            f"Capital  : {cur_cap:.2f}",
-            f"PnL %    : {pct_pnl:+.2f}%",
-            f"Month PnL: {m_pnl:+.2f}",
-            "-" * 20,
-            f"Recent: {last_str}"
-        ]
-        
-        try:
-            th = pnl_engine.trading_hours_summary()
-            lines.append(f"Avg/hr    : {th['avg_per_hour']}")
-        except: pass
-
         # 3. Handle LTP for Indicators (Use Index instead of Option)
         tr_current_ui = tr_symbol.get().strip().upper()
         # Use active_symbol if we have one, otherwise UI symbol
@@ -1022,6 +1038,32 @@ def update_monitor_ui():
         
         indicator_data = scalp_manager.get_signal()
         sig = indicator_data['signal']
+
+        # 🎯 CAPITAL CALCULATION
+        cur_cap = pnl_engine.get_current_capital()
+        pct_pnl = pnl_engine.get_pnl_percentage()
+        m_pnl = get_monthly_pnl_summary(net)
+
+        lines = [
+            f"Trades: {len(completed)}",
+            f"W/L   : {wins}/{losses} ({win_rate}%)",
+            "-" * 20,
+            f"Gross PnL: {gross}",
+            f"Net PnL  : {net}",
+            f"Charges  : {charges}",
+            "-" * 20,
+            f"Capital  : {cur_cap:.2f}",
+            f"PnL %    : {pct_pnl:+.2f}%",
+            f"Month PnL: {m_pnl:+.2f}",
+            "-" * 20,
+            f"RSI: {indicator_data.get('rsi', 0)} | Mom: {indicator_data.get('momentum', 0)}",
+            f"Recent: {last_str}"
+        ]
+        
+        try:
+            th = pnl_engine.trading_hours_summary()
+            lines.append(f"Avg/hr    : {th['avg_per_hour']}")
+        except: pass
         
         global market_sideways, market_exhausted, eod_saved_today
         market_sideways = indicator_data.get("sideways", False)
@@ -1032,7 +1074,14 @@ def update_monitor_ui():
         # Save EOD Capital at 3:30 PM (15:30)
         if now.hour == 15 and now.minute >= 30 and not eod_saved_today:
             try:
-                row = {"Date": now.strftime("%Y-%m-%d"), "Initial Capital": pnl_engine.initial_capital, "Net PnL": net, "Closing Capital": cur_cap, "% Change": pct_pnl}
+                row = {
+                    "Date": now.strftime("%Y-%m-%d"), 
+                    "Initial Capital": pnl_engine.initial_capital, 
+                    "Net PnL": net, 
+                    "Closing Capital": cur_cap, 
+                    "% Change": pct_pnl,
+                    "Trades": len(completed)
+                }
                 file_exists = os.path.exists(CAPITAL_HISTORY_FILE)
                 with open(CAPITAL_HISTORY_FILE, "a", newline="") as f:
                     import csv
@@ -1040,7 +1089,7 @@ def update_monitor_ui():
                     if not file_exists: writer.writeheader()
                     writer.writerow(row)
                 eod_saved_today = True
-                log_with_callback(log_cb, f"🏁 EOD Capital Saved: {cur_cap:.2f} ({pct_pnl:+.2f}%)")
+                log_with_callback(log_cb, f"🏁 EOD Capital Saved: {cur_cap:.2f} ({pct_pnl:+.2f}%) | Trades: {len(completed)}")
             except Exception as ee:
                 log_with_callback(log_cb, f"⚠️ EOD Save Error: {ee}")
         elif now.hour < 9: # Reset for new day
@@ -1052,15 +1101,18 @@ def update_monitor_ui():
         elif sig == "BEARISH":
             trade_status = "📉 BEARISH SETUP"
             trade_color = "#10b981" # Emerald Green
-        elif market_sideways:
-            trade_status = "⏸️ MARKET SIDEWAYS"
-            trade_color = "#f97316" # Orange
         elif market_exhausted:
             trade_status = "⚠️ MARKET EXHAUSTED"
             trade_color = "#ef4444" # Red
+        elif market_sideways:
+            trade_status = "⏸️ MARKET SIDEWAYS"
+            trade_color = "#f97316" # Orange
         elif sig == "NEUTRAL":
-            trade_status = "⚖️ NEUTRAL / WAITING"
+            trade_status = f"⚖️ NEUTRAL (RSI:{indicator_data.get('rsi')} / Tgt:{RSIM_RSI_UP}|{RSIM_RSI_DOWN})"
             trade_color = "#6b7280" # Gray
+        elif "CONFIRMING" in sig:
+            trade_status = f"⏳ {sig}"
+            trade_color = "#f97316" # Orange
         elif "WAITING" in sig:
             # Extract (N pts) info
             pts_info = sig.split("WAITING")[1] if "WAITING" in sig else ""
@@ -1128,27 +1180,31 @@ def update_monitor_ui():
                 
                 effective_sl_pts = initial_sl - trail_gain
                 
+                target_price = last_buy_price + target
+                sl_price = last_buy_price - effective_sl_pts
+                
                 lines.append("-" * 20)
                 lines.append(f"Position: {profit:+.2f} pts")
-                lines.append(f"Tgt: {target:.1f} | SL: {effective_sl_pts:.1f} {'(Trl)' if trail_gain > 0 else ''}")
+                lines.append(f"Tgt : {target_price:.2f} | SL: {sl_price:.2f}")
                 
-                if auto_mode:
-                    print(f"DEBUG: Track Exit | {active_symbol} | LTP: {cur_ltp} | Profit: {profit:+.2f} | Tgt: {target} | SL: {-effective_sl_pts:.2f}")
+                # if auto_buy or auto_sell:
+                #     print(f"DEBUG: Track Exit | {active_symbol} | LTP: {cur_ltp} | Profit: {profit:+.2f} | Tgt: {target} | SL: {-effective_sl_pts:.2f}")
 
-                if auto_mode and profit >= target:
+                if auto_sell and profit >= target:
                     if pt_step > 0:
                         max_profit = max_price_seen - last_buy_price
+                        pt_trigger_price = (last_buy_price + max_profit) - pt_step
                         if profit <= (max_profit - pt_step):
                             log_with_callback(log_cb, f"🎯 TRAILING PROFIT HIT (Peak {max_profit:+.2f} -> Current {profit:+.2f}). Exiting...")
                             run_bg(do_exit, reason="Trail-Profit")
                             return
-                        # If PT is set but not hit yet, we display a special status
-                        lines.append(f"PT Active: Break below {max_profit-pt_step:.2f}")
+                        # Display Trailing Trigger Level
+                        lines.append(f"Exit Tgt: {pt_trigger_price:.2f} (Trailing)")
                     else:
                         log_with_callback(log_cb, f"🎯 TARGET REACHED ({profit:+.2f} pts). Exiting...")
                         run_bg(do_exit, reason="Target")
                         return
-                elif auto_mode and profit <= -effective_sl_pts:
+                elif auto_sell and profit <= -effective_sl_pts:
                     log_with_callback(log_cb, f"🛑 STOP LOSS HIT ({profit:+.2f} pts). Exiting...")
                     run_bg(do_exit, reason="SL")
                     return
@@ -1160,7 +1216,7 @@ def update_monitor_ui():
         root.after(0, lambda: strategy_status_label.config(text=f"Strategy: {trade_status}", foreground=trade_color))
 
         # 🤖 AUTO MODE LOGIC
-        if auto_mode and not buy_active and not buy_pending:
+        if auto_buy and not buy_active and not buy_pending:
             tr = tr_symbol.get().strip().upper()
             is_ce = tr.endswith("CE")
             is_pe = tr.endswith("PE")
@@ -1174,18 +1230,6 @@ def update_monitor_ui():
             elif sig == "BEARISH":
                 if is_pe: should_buy = True
                 elif is_ce: mismatch_msg = "Market is BEARISH, but a CALL (CE) is selected. Skipping..."
-
-            if should_buy:
-                # Extra Step 3 Check: Price not more than 5 points above/below EMA
-                ema = indicator_data.get("ema", 0)
-                cur_p = indicator_data.get("ltp", 0)
-                proximity_ok = False
-                if sig == "BULLISH" and cur_p <= (ema + 5): proximity_ok = True
-                elif sig == "BEARISH" and cur_p >= (ema - 5): proximity_ok = True
-                
-                if not proximity_ok:
-                    log_with_callback(log_cb, f"⚠️ AUTO: {sig} signal detected, but price ({cur_p}) is too far from EMA ({ema}). Skipping...")
-                    should_buy = False
 
             if should_buy:
                 # Check if buy is actually allowed (not disabled)
@@ -1254,40 +1298,59 @@ def process_buy_disable_logic(engine):
                     disabled_until_ts = data.get("disabled_until", 0)
         except: pass
 
-    # Find the single highest applicable threshold
-    app_t = 0
-    app_d = 0
-    for threshold, duration_mins in PROGRESSIVE_LOSS_CONFIG:
+    # 2. Threshold Check
+    # Find the single HIGHEST applicable threshold
+    # Sort config High-to-Low to ensure we get the biggest mismatch
+    sorted_config = sorted(PROGRESSIVE_LOSS_CONFIG, key=lambda x: x[0], reverse=True)
+    app_t, app_d = 0, 0
+    for threshold, duration_mins in sorted_config:
         if loss_amount >= threshold:
             app_t = threshold
             app_d = duration_mins
             break
             
     # Handle Recovery: If we improved below the highest threshold hit earlier
-    if highest_threshold_hit > 0 and loss_amount < highest_threshold_hit:
-        log_with_callback(log_cb, f"📈 Recovery Detected: Net Loss {net_pnl:.2f} is improving (Previous worst: {highest_threshold_hit}).")
-        # Clear lockout immediately as losses are reducing
-        with open(BUY_DISABLED_FILE, 'w') as f:
-            json.dump({"disabled_until": 0, "last_trade_id": "recovery", "date": today_str, "highest_threshold": app_t}, f)
-        log_with_callback(log_cb, "✅ Recovery: Buying re-enabled as losses are reducing.")
+    # We only clear if we are NOT in a Hard Stop zone (>= 2501)
+    if highest_threshold_hit > 0 and highest_threshold_hit < 2501 and app_t < highest_threshold_hit:
+        if current_label != "recovery":
+            log_with_callback(log_cb, f"📈 Recovery Detected: Net Loss {loss_amount:.0f} improved below {highest_threshold_hit}.")
+            with open(BUY_DISABLED_FILE, 'w') as f:
+                json.dump({
+                    "disabled_until": 0, 
+                    "last_trade_id": "recovery", 
+                    "date": today_str, 
+                    "highest_threshold": highest_threshold_hit
+                }, f)
+            log_with_callback(log_cb, "✅ Recovery: Buying re-enabled as losses are reducing.")
         return
 
     # Handle New/Higher Lockout
-    if app_t > 0:
+    # Trigger ONLY if current threshold is HIGHER than the peak hit (highest_threshold_hit)
+    # This prevents re-triggering for same loss level after reset/refresh.
+    if app_t > 0 and app_t > highest_threshold_hit:
         label = f"max_loss_{app_t}"
-        if app_t > highest_threshold_hit or (app_t == highest_threshold_hit and current_label != label):
-            disabled_until_ts = time.time() + (app_d * 60)
-            with open(BUY_DISABLED_FILE, 'w') as f:
-                json.dump({"disabled_until": disabled_until_ts, "last_trade_id": label, "date": today_str, "highest_threshold": app_t}, f)
-            dur_str = f"{app_d} mins" if app_d < 1440 else "tomorrow"
-            log_with_callback(log_cb, f"⚠️ LOCKOUT: Loss {loss_amount:.2f} hit {app_t}. Buy disabled for {dur_str}.")
+        disabled_until_ts = time.time() + (app_d * 60)
+        with open(BUY_DISABLED_FILE, 'w') as f:
+            json.dump({
+                "disabled_until": disabled_until_ts, 
+                "last_trade_id": label, 
+                "date": today_str, 
+                "highest_threshold": app_t
+            }, f)
+        dur_str = f"{app_d} mins" if app_d < 1440 else "tomorrow"
+        log_with_callback(log_cb, f"⚠️ LOCKOUT: Increasing Loss hit {app_t}. (Prev Peak: {highest_threshold_hit}). Buy disabled for {dur_str}.")
         return
 
     if net_pnl >= BUY_DISABLE_MAX_PROFIT:
         if current_label != "max_profit":
              disabled_until_ts = time.time() + 86400 # 24 hours
              with open(BUY_DISABLED_FILE, 'w') as f:
-                 json.dump({"disabled_until": disabled_until_ts, "last_trade_id": "max_profit", "date": today_str}, f)
+                 json.dump({
+                     "disabled_until": disabled_until_ts, 
+                     "last_trade_id": "max_profit", 
+                     "date": today_str,
+                     "highest_threshold": highest_threshold_hit
+                 }, f)
              log_with_callback(log_cb, f"SUCCESS: Net Profit {net_pnl} exceeds limit {BUY_DISABLE_MAX_PROFIT}. Buy disabled until tomorrow.")
         return
 
@@ -1301,7 +1364,12 @@ def process_buy_disable_logic(engine):
         if all(t.get("net_pnl", 0) < 0 for t in last_n) and last_trade_ts != current_label:
             disabled_until_ts = time.time() + BUY_DISABLE_DURATION
             with open(BUY_DISABLED_FILE, 'w') as f:
-                json.dump({"disabled_until": disabled_until_ts, "last_trade_id": last_trade_ts, "date": today_str}, f)
+                json.dump({
+                    "disabled_until": disabled_until_ts, 
+                    "last_trade_id": last_trade_ts, 
+                    "date": today_str,
+                    "highest_threshold": highest_threshold_hit
+                }, f)
             log_with_callback(log_cb, f"INFO: Buy disabled for {BUY_DISABLE_DURATION // 60} mins due to {BUY_DISABLE_LOSS_COUNT} losses.")
             return
 

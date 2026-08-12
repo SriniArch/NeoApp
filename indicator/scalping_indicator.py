@@ -152,6 +152,92 @@ class ScalpingStrategyV1(BaseStrategy):
             "trend": "UP" if up_seq else "DOWN" if down_seq else "FLAT"
         }
 
+class RSIMomentumStrategy(BaseStrategy):
+    """
+    RSI and Momentum based strategy with Sustain Ticks.
+    BULLISH: RSI > RSIM_RSI_UP and Momentum > RSIM_MOMENTUM for RSIM_SUSTAIN_TICKS
+    BEARISH: RSI < RSIM_RSI_DOWN and Momentum < -RSIM_MOMENTUM for RSIM_SUSTAIN_TICKS
+    """
+    def get_signal(self, history: pd.DataFrame) -> dict:
+        from common.config import RSIM_RSI_UP, RSIM_RSI_DOWN, RSIM_MOMENTUM, RSIM_SUSTAIN_TICKS
+
+        if len(history) < 20: # Need at least 20 for BB Width
+            needed = 20 - len(history)
+            return {"signal": f"WAITING ({needed} pts)", "ema": 0, "roc": 0, "bb_width": 0, "rsi": 0, "momentum": 0, "pulse": False}
+
+        prices = history['ltp'].astype(float)
+        symbol = str(history['symbol'].iloc[-1]).upper()
+        
+        rsi_series = ScalpingIndicator.calculate_rsi(prices, 14)
+        rsi = rsi_series.iloc[-1]
+        
+        momentum_series = ScalpingIndicator.calculate_momentum(prices, 14)
+        momentum = momentum_series.iloc[-1]
+        
+        # Consistent Indicators for UI
+        ema = ScalpingIndicator.calculate_ema(prices, 9).iloc[-1]
+        roc = ScalpingIndicator.calculate_roc(prices, 18).iloc[-1]
+        bb_width_series = ScalpingIndicator.calculate_bb_width(prices, 20, 2)
+        bb_width = bb_width_series.iloc[-1]
+        
+        # Sideways / Exhausted logic
+        bbw_floor = 12.0 # Default NIFTY
+        roc_ceiling = 0.15 # Default NIFTY
+        if any(idx in symbol for idx in ["SENSEX", "BSX", "BANKEX"]):
+            bbw_floor = 20.0
+            roc_ceiling = 0.30
+
+        is_sideways = bb_width < bbw_floor
+        is_exhausted = abs(roc) > roc_ceiling
+
+        # Sustain logic (Check last N ticks)
+        n = RSIM_SUSTAIN_TICKS
+        num_bullish = 0
+        num_bearish = 0
+        
+        # Check consecutive matches from newest to oldest
+        for i in range(1, n + 1):
+            if len(rsi_series) >= i:
+                r = rsi_series.iloc[-i]
+                m = momentum_series.iloc[-i]
+                if not np.isnan(r) and not np.isnan(m):
+                    if r > RSIM_RSI_UP and m > RSIM_MOMENTUM: num_bullish += 1
+                    else: break
+                else: break
+        
+        for i in range(1, n + 1):
+            if len(rsi_series) >= i:
+                r = rsi_series.iloc[-i]
+                m = momentum_series.iloc[-i]
+                if not np.isnan(r) and not np.isnan(m):
+                    if r < RSIM_RSI_DOWN and m < -RSIM_MOMENTUM: num_bearish += 1
+                    else: break
+                else: break
+
+        signal = "NEUTRAL"
+        if num_bullish >= n:
+            signal = "BULLISH"
+        elif num_bearish >= n:
+            signal = "BEARISH"
+        elif num_bullish > 0:
+            signal = f"CONFIRMING BULLISH ({num_bullish}/{n})"
+        elif num_bearish > 0:
+            signal = f"CONFIRMING BEARISH ({num_bearish}/{n})"
+            
+        return {
+            "signal": signal,
+            "ema": round(ema, 2),
+            "roc": round(roc, 4),
+            "bb_width": round(bb_width, 2),
+            "rsi": round(rsi, 2) if not np.isnan(rsi) else 0,
+            "momentum": round(momentum, 2) if not np.isnan(momentum) else 0,
+            "ltp": prices.iloc[-1],
+            "pulse": False,
+            "exhausted": is_exhausted,
+            "sideways": is_sideways,
+            "trend": "UP" if momentum > 0 else "DOWN" if momentum < 0 else "FLAT"
+        }
+
 class LiveScalpingManager:
     """
     Manages live LTP data and delegates indicator calculations to a Strategy.
