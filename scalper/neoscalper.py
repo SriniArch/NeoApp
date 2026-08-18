@@ -2,7 +2,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import sys, os, re, difflib
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import csv
 
 import sys
@@ -119,6 +119,27 @@ def get_overall_pnl_summary(current_net_pnl=0.0):
             
     if base_cap == 0: return 0.0
     return round((total_pnl / base_cap) * 100, 2)
+
+
+def get_current_week_window():
+    today = datetime.now().date()
+    monday = today - timedelta(days=today.weekday())
+    friday = monday + timedelta(days=4)
+    return monday, friday
+
+
+def filter_current_week_trades(completed_trades):
+    monday, friday = get_current_week_window()
+    weekly_trades = []
+
+    for t in completed_trades:
+        trade_time = t.get("sell_time") or t.get("buy_time")
+        if not trade_time or not hasattr(trade_time, "date"):
+            continue
+        if monday <= trade_time.date() <= friday:
+            weekly_trades.append(t)
+
+    return weekly_trades, monday, friday
 
 pnl_engine = PositionPnLEngine(initial_capital=get_latest_capital()) 
 eod_saved_today = False 
@@ -1234,14 +1255,26 @@ def update_monitor_ui():
 
         # 2.1 Calculate Stats using persistent engine
         completed = pnl_engine.completed_trades
-        pnls = [round(t["net_pnl"]) for t in completed]
+        weekly_completed, week_start, week_end = filter_current_week_trades(completed)
+
+        pnls = [round(t["net_pnl"]) for t in weekly_completed]
         wins = sum(1 for p in pnls if p > 0)
         losses = sum(1 for p in pnls if p < 0)
         win_rate = round((wins / len(pnls) * 100), 1) if pnls else 0.0
         
-        gross = round(sum(t["gross_pnl"] for t in completed), 2)
-        net = round(sum(t["net_pnl"] for t in completed), 2)
-        charges = round(sum(t["charges"] for t in completed), 2)
+        gross = round(sum(t["gross_pnl"] for t in weekly_completed), 2)
+        net = round(sum(t["net_pnl"] for t in weekly_completed), 2)
+        charges = round(sum(t["charges"] for t in weekly_completed), 2)
+
+        today = datetime.now().date()
+        day_net = round(
+            sum(
+                t["net_pnl"]
+                for t in weekly_completed
+                if ((t.get("sell_time") or t.get("buy_time")) and (t.get("sell_time") or t.get("buy_time")).date() == today)
+            ),
+            2,
+        )
         
         last_str = " | ".join(str(p) for p in pnls[-5:])
 
@@ -1317,19 +1350,16 @@ def update_monitor_ui():
         # 🎯 CAPITAL CALCULATION
         cur_cap = pnl_engine.get_current_capital()
         pct_pnl = pnl_engine.get_pnl_percentage()
-        o_pnl_pct = get_overall_pnl_summary(net)
 
         lines = [
-            f"Trades: {len(completed)}",
+            f"Week (Mon-Fri): {week_start} to {week_end}",
+            f"Trades: {len(weekly_completed)}",
             f"W/L   : {wins}/{losses} ({win_rate}%)",
             "-" * 20,
             f"Gross PnL: {gross}",
             f"Net PnL  : {net}",
+            f"Day PnL  : {day_net}",
             f"Charges  : {charges}",
-            "-" * 20,
-            f"Capital  : {cur_cap:.2f}",
-            f"PnL %    : {pct_pnl:+.2f}%",
-            f"Overall PnL %: {o_pnl_pct:+.2f}%",
             "-" * 20,
             f"RSI: {indicator_data.get('rsi', 0)} | Mom: {indicator_data.get('momentum', 0)}",
             f"Res: {indicator_data.get('sr', {}).get('resistance', 0)} | Sup: {indicator_data.get('sr', {}).get('support', 0)}",
@@ -1557,7 +1587,7 @@ def update_monitor_ui():
         # 4. Render on Main Thread
 
         # 5. Render on Main Thread
-        root.after(0, lambda: render_monitor_display(lines, net, gross))
+        root.after(0, lambda: render_monitor_display(lines, net, gross, day_net))
 
     except Exception as e:
         log_with_callback(log_cb, f"Monitor Error: {e}")
@@ -1795,7 +1825,7 @@ def save_trades_to_csv(trades_to_log):
     except Exception as e:
         log_with_callback(log_cb, f"CSV Error: {e}")
 
-def render_monitor_display(lines, net_val, gross_val):
+def render_monitor_display(lines, net_val, gross_val, day_net_val=0.0):
     global last_display_content
     current_content = "\n".join(lines)
     if current_content == last_display_content and last_display_content != "":
@@ -1821,11 +1851,7 @@ def render_monitor_display(lines, net_val, gross_val):
             tag = None
             if line.startswith("Net"): tag = "green" if net_val > 0 else "red"
             elif line.startswith("Gross"): tag = "green" if gross_val > 0 else "red"
-            elif line.startswith("Overall PnL %"):
-                try:
-                    o_val = float(line.split(": ")[1].replace("%", ""))
-                    tag = "green" if o_val > 0 else "red" if o_val < 0 else None
-                except: tag = None
+            elif line.startswith("Day PnL"): tag = "green" if day_net_val > 0 else "red" if day_net_val < 0 else None
             elif "Allowed to Trade" in line: tag = "green"
             elif "Dont Trade" in line: tag = "red"
             mon_text.insert(tk.END, line + "\n", tag)

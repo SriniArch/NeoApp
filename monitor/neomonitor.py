@@ -6,8 +6,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.neo_login import get_neo_client
 from common.orders import get_client, ensure_login as do_login
-import datetime
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 from monitor.pnl_engine import PositionPnLEngine, parse_api_orders
 import json
@@ -85,6 +84,29 @@ def print_last_5_trades_inline(completed_trades):
     print(f"Recent: {line}")
 
 
+def get_current_week_window():
+    today = datetime.now().date()
+    monday = today - timedelta(days=today.weekday())
+    friday = monday + timedelta(days=4)
+    return monday, friday
+
+
+def filter_current_week_trades(completed_trades):
+    monday, friday = get_current_week_window()
+    weekly_trades = []
+
+    for t in completed_trades:
+        trade_time = t.get("sell_time") or t.get("buy_time")
+        if not trade_time or not hasattr(trade_time, "date"):
+            continue
+
+        trade_date = trade_time.date()
+        if monday <= trade_date <= friday:
+            weekly_trades.append(t)
+
+    return weekly_trades, monday, friday
+
+
 
 last_trade_count = 0
 
@@ -118,6 +140,8 @@ while True:
     for t in trades:
         engine.add_trade(t)
 
+    weekly_trades, week_start, week_end = filter_current_week_trades(engine.completed_trades)
+
     # Check for buy disable due to losses
     # Only trigger if new trades have been added since last disable
     last_disabled_trade_id = None
@@ -132,7 +156,7 @@ while True:
     today_str = datetime.now().strftime("%Y-%m-%d")
     if ENABLE_BUY_DISABLE:
         # 1. Progressive Loss Check
-        net_pnl = sum(t["net_pnl"] for t in engine.completed_trades)
+        net_pnl = sum(t["net_pnl"] for t in weekly_trades)
         loss_amount = -net_pnl
         for threshold, duration_mins in PROGRESSIVE_LOSS_CONFIG:
             if loss_amount >= threshold:
@@ -154,8 +178,8 @@ while True:
                 print(f"SUCCESS: Net Profit {net_pnl} hit target {BUY_DISABLE_MAX_PROFIT}. Buy disabled until tomorrow.")
 
         # 3. Consecutive Loss Check
-        if len(engine.completed_trades) >= BUY_DISABLE_LOSS_COUNT:
-            last_n = engine.completed_trades[-BUY_DISABLE_LOSS_COUNT:]
+        if len(weekly_trades) >= BUY_DISABLE_LOSS_COUNT:
+            last_n = weekly_trades[-BUY_DISABLE_LOSS_COUNT:]
             last_trade_time = last_n[-1].get("sell_time") or last_n[-1].get("buy_time")
             last_trade_ts = None
             if last_trade_time:
@@ -179,23 +203,19 @@ while True:
         except:
             pass
 
-    current_trade_count = len(engine.completed_trades)
+    current_trade_count = len(weekly_trades)
 
     # ✅ Print ONLY if trade count changed
     if current_trade_count != last_trade_count:
         # 3️⃣ Compute stats
-        stats = trade_statistics(engine.completed_trades)
+        stats = trade_statistics(weekly_trades)
 
-        gross_sum = round(sum(t["gross_pnl"] for t in engine.completed_trades), 2)
-        net_sum   = round(sum(t["net_pnl"]   for t in engine.completed_trades), 2)
-
-        print_last_5_trades_inline(engine.completed_trades)
+        print(f"Week (Mon-Fri): {week_start} to {week_end}")
+        print_last_5_trades_inline(weekly_trades)
         print("No of trades :", stats["no_of_trades"])
         print("Wins         :", stats["wins"])
         print("Losses       :", stats["losses"])
         print("Win rate %   :", stats["win_rate"])
-        print("Gross P&L    :", gross_sum)
-        print("Net P&L      :", net_sum)
         print("Approx Charges:", stats["no_of_trades"] * 5)  # assuming avg 100 per trade
         # (Hourly counts removed per user preference)
 
