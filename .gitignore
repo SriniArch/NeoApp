@@ -13,3 +13,4 @@ miniforge.sh
 logs/*.json
 *.json
 
+buy_disabled.json
