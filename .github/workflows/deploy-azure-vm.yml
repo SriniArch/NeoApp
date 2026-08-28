@@ -1,0 +1,77 @@
+name: Deploy to Azure VM
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_ref:
+        description: "Git ref to deploy"
+        required: false
+        default: "main"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.deploy_ref || github.ref }}
+
+      - name: Build release bundle
+        run: |
+          mkdir -p release
+          tar --exclude='.git' --exclude='.venv' --exclude='__pycache__' -czf release/neoapp.tar.gz .
+          sha256sum release/neoapp.tar.gz > release/neoapp.sha256
+
+      - name: Upload bundle to VM
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.AZURE_VM_HOST }}
+          username: ${{ secrets.AZURE_VM_USER }}
+          key: ${{ secrets.AZURE_VM_SSH_KEY }}
+          port: ${{ secrets.AZURE_VM_PORT || 22 }}
+          source: "release/neoapp.tar.gz,release/neoapp.sha256"
+          target: "${{ secrets.DEPLOY_PATH }}/incoming"
+
+      - name: Deploy and restart services
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.AZURE_VM_HOST }}
+          username: ${{ secrets.AZURE_VM_USER }}
+          key: ${{ secrets.AZURE_VM_SSH_KEY }}
+          port: ${{ secrets.AZURE_VM_PORT || 22 }}
+          script: |
+            set -e
+            APP_DIR="${{ secrets.DEPLOY_PATH }}"
+            RELEASE_DIR="$APP_DIR/releases/$(date +%Y%m%d%H%M%S)"
+            VENV_DIR="$APP_DIR/venv"
+            mkdir -p "$RELEASE_DIR"
+
+            cp "$APP_DIR/incoming/release/neoapp.tar.gz" "$RELEASE_DIR/"
+            cp "$APP_DIR/incoming/release/neoapp.sha256" "$RELEASE_DIR/"
+
+            cd "$RELEASE_DIR"
+            sha256sum -c neoapp.sha256
+            tar -xzf neoapp.tar.gz
+
+            ln -sfn "$RELEASE_DIR" "$APP_DIR/current"
+
+            if [ ! -x "$VENV_DIR/bin/python" ]; then
+              python3 -m venv "$VENV_DIR"
+            fi
+
+            "$VENV_DIR/bin/pip" install --upgrade pip
+            "$VENV_DIR/bin/pip" install -r "$APP_DIR/current/requirements.txt" -r "$APP_DIR/current/requirements-web.txt"
+
+            sudo systemctl restart neo-worker.service
+            sudo systemctl restart neo-fastapi.service
+            sudo systemctl reload nginx
+
+            sleep 5
+            curl -fsS http://127.0.0.1:8000/health
+
+            if [ -n "${{ secrets.AZURE_PUBLIC_URL }}" ]; then
+              curl -fsS "${{ secrets.AZURE_PUBLIC_URL }}/health"
+            fi

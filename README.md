@@ -75,6 +75,99 @@ A professional trading application for scalping and real-time PnL monitoring, bu
 python run.py
 ```
 
+### Web Mode (Initial Implementation)
+
+An initial web stack is now available with FastAPI + worker:
+
+- API: [web/backend/main.py](web/backend/main.py)
+- Worker: [web/worker/main.py](web/worker/main.py)
+- Shared snapshot/state helpers: [web/shared/monitor_snapshot.py](web/shared/monitor_snapshot.py), [web/shared/state_store.py](web/shared/state_store.py)
+
+Install web dependencies:
+
+```bash
+pip install -r requirements-web.txt
+```
+
+Run worker (builds monitor snapshot from broker orders):
+
+```bash
+python -m web.worker.main
+```
+
+Run API server:
+
+```bash
+uvicorn web.backend.main:app --host 0.0.0.0 --port 8000
+```
+
+Key endpoints:
+
+- `GET /health`
+- `GET /api/system/status`
+- `GET /api/monitor/snapshot`
+- `POST /api/trade/action` (`BUY` / `EXIT`)
+- `POST /api/symbol/suggest` (ATM/offset symbol suggestion)
+- `WS /ws/monitor`
+
+Recommended `.env` flags for web mode:
+
+```env
+WEB_API_TOKEN=change_this_to_a_long_random_token
+TRADING_ENABLED=false
+WEB_POLL_SECONDS=5
+WORKER_HEALTH_WINDOW_SECONDS=30
+WEB_LOG_LEVEL=INFO
+
+# Optional automation flags
+AUTO_BUY_ENABLED=false
+AUTO_SELL_ENABLED=false
+AUTO_BASE_INDEX=NIFTY
+AUTO_STRIKE_OFFSET=0
+AUTO_LOTS=1
+AUTO_TARGET=2
+AUTO_SL=1.5
+AUTO_TSL_STEP=1
+AUTO_PT_STEP=1
+```
+
+Notes:
+
+- `WEB_API_TOKEN` is enforced by default.
+- `TRADING_ENABLED=false` blocks live order placement via web API.
+- Set `WEB_ALLOW_LOCAL_NOAUTH=true` only for local debugging.
+
+Web mode currently includes:
+
+- Position-safe order execution checks (single open derivative position guard)
+- Order completion verification via order history/report
+- Risk state in snapshot (progressive lockouts + cool-off status)
+- Rich monitor payload (`indicator`, `position`, `risk`, `automation`)
+- Trade journal append (`logs/trades_web_YYYY-MM-DD.csv`)
+- Strike helper (base + LTP + CE/PE + offset)
+
+### GitHub Actions Deployment (Azure VM)
+
+Deployment workflow added:
+
+- [.github/workflows/deploy-azure-vm.yml](.github/workflows/deploy-azure-vm.yml)
+
+This workflow:
+
+1. Creates a release bundle
+2. Uploads to Azure VM over SSH
+3. Switches the active release symlink
+4. Restarts `neo-worker.service` and `neo-fastapi.service`
+5. Calls `/health` for verification
+
+Required repository secrets:
+
+- `AZURE_VM_HOST`
+- `AZURE_VM_USER`
+- `AZURE_VM_SSH_KEY`
+- `AZURE_VM_PORT` (optional)
+- `DEPLOY_PATH`
+
 The application will:
 1. Auto-login using your credentials
 2. Load the scrip master data
