@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NeoApp Monitor</title>
+  <style>
+    body { font-family: Inter, Segoe UI, Arial, sans-serif; background:#0b1220; color:#e5e7eb; margin:0; }
+    .wrap { max-width:900px; margin:24px auto; padding:16px; }
+    .card { background:#111827; border:1px solid #1f2937; border-radius:12px; padding:16px; margin-bottom:12px; }
+    h1 { margin:0 0 12px; font-size:22px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    input, button, select { background:#0f172a; color:#e5e7eb; border:1px solid #334155; border-radius:8px; padding:8px 10px; }
+    button { cursor:pointer; }
+    .kpi { display:grid; grid-template-columns:repeat(2,minmax(160px,1fr)); gap:8px; }
+    .pill { background:#0f172a; border:1px solid #334155; border-radius:8px; padding:8px; }
+    .green { color:#4ade80; }
+    .red { color:#f87171; }
+    .muted { color:#94a3b8; }
+    #status { font-weight:600; }
+    code { color:#93c5fd; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>NeoApp Web Monitor</h1>
+      <div class="row">
+        <label>API Token</label>
+        <input id="token" type="password" placeholder="WEB_API_TOKEN (optional)" style="min-width:280px"/>
+        <button id="connectBtn">Connect</button>
+        <span id="status" class="muted">Disconnected</span>
+      </div>
+      <div class="muted" style="margin-top:8px">API: <code>/api/monitor/snapshot</code> | WS: <code>/ws/monitor</code></div>
+      <div id="message" class="muted" style="margin-top:8px">Click Connect to start live updates.</div>
+    </div>
+
+    <div class="card">
+      <div class="kpi">
+        <div class="pill">Trading Enabled: <b id="tradingEnabled">--</b></div>
+        <div class="pill">Worker Health: <b id="workerHealth">--</b></div>
+        <div class="pill">Risk: <b id="riskState">--</b></div>
+        <div class="pill">Position: <b id="positionState">--</b></div>
+        <div class="pill">Server IP: <b id="serverIp">--</b></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h1 style="font-size:18px">Strike Helper</h1>
+      <div class="row">
+        <label>Base</label>
+        <select id="baseSymbol">
+          <option value="NIFTY">NIFTY</option>
+          <option value="BANKNIFTY">BANKNIFTY</option>
+          <option value="SENSEX">SENSEX</option>
+          <option value="FINNIFTY">FINNIFTY</option>
+          <option value="BANKEX">BANKEX</option>
+        </select>
+        <label>Index LTP</label>
+        <input id="indexLtp" type="number" step="0.05" placeholder="e.g. 25324.5" style="width:140px" />
+        <label>Type</label>
+        <select id="optionType">
+          <option value="CE">CE</option>
+          <option value="PE">PE</option>
+        </select>
+        <label>Offset</label>
+        <input id="strikeOffset" type="number" min="-10" max="10" step="1" value="0" style="width:90px" />
+        <button id="suggestBtn">Suggest Symbol</button>
+      </div>
+      <div id="suggestedSymbol" class="muted" style="margin-top:8px">Suggested Symbol: --</div>
+    </div>
+
+    <div class="card">
+      <h1 style="font-size:18px">Trade Controls</h1>
+      <div class="row">
+        <label>Symbol</label>
+        <input id="tradeSymbol" type="text" placeholder="NIFTY26AUG25000CE" style="min-width:240px" />
+        <label>Lots</label>
+        <input id="tradeLots" type="number" min="1" step="1" value="1" style="width:100px" />
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="buyBtn">BUY</button>
+        <button id="exitBtn">EXIT</button>
+        <span id="tradeStatus" class="muted">Idle</span>
+      </div>
+      <div id="tradeResponse" class="muted" style="margin-top:8px; white-space:pre-wrap; word-break:break-word">--</div>
+    </div>
+
+    <div class="card">
+      <div id="week" class="muted">Week: --</div>
+      <div class="kpi" style="margin-top:10px">
+        <div class="pill">Trades: <b id="trades">--</b></div>
+        <div class="pill">W/L: <b id="wl">--</b></div>
+        <div class="pill">Win Rate: <b id="winrate">--</b></div>
+        <div class="pill">Gross PnL: <b id="gross">--</b></div>
+        <div class="pill">Net PnL: <b id="net">--</b></div>
+        <div class="pill">Day PnL: <b id="day">--</b></div>
+        <div class="pill">Charges: <b id="charges">--</b></div>
+        <div class="pill">Recent: <b id="recent">--</b></div>
+      </div>
+      <div class="kpi" style="margin-top:8px">
+        <div class="pill">Signal: <b id="signal">--</b></div>
+        <div class="pill">RSI/Mom: <b id="rsiMom">--</b></div>
+        <div class="pill">S/R: <b id="sr">--</b></div>
+        <div class="pill">State: <b id="marketState">--</b></div>
+      </div>
+      <div class="muted" id="updated" style="margin-top:10px">Updated: --</div>
+    </div>
+  </div>
+
+  <script>
+    let ws;
+    let reconnectTimer;
+    const tokenEl = document.getElementById('token');
+    const tradeSymbolEl = document.getElementById('tradeSymbol');
+    const tradeLotsEl = document.getElementById('tradeLots');
+    const tradeStatusEl = document.getElementById('tradeStatus');
+    const tradeResponseEl = document.getElementById('tradeResponse');
+    const buyBtn = document.getElementById('buyBtn');
+    const exitBtn = document.getElementById('exitBtn');
+    const suggestBtn = document.getElementById('suggestBtn');
+    let lastToken = '';
+
+    function setStatus(msg, cls='muted') {
+      const el = document.getElementById('status');
+      el.textContent = msg;
+      el.className = cls;
+    }
+
+    function setMessage(msg, cls='muted') {
+      const el = document.getElementById('message');
+      el.textContent = msg;
+      el.className = cls;
+    }
+
+    function setTradeBusy(busy, text='Working...') {
+      buyBtn.disabled = busy;
+      exitBtn.disabled = busy;
+      tradeStatusEl.textContent = busy ? text : 'Idle';
+      tradeStatusEl.className = busy ? 'muted' : 'muted';
+    }
+
+    function setTradeResult(msg, cls='muted') {
+      tradeResponseEl.textContent = msg;
+      tradeResponseEl.className = cls;
+    }
+
+    function colorize(el, val) {
+      el.classList.remove('green', 'red');
+      const n = Number(val);
+      if (n > 0) el.classList.add('green');
+      else if (n < 0) el.classList.add('red');
+    }
+
+    function render(payload) {
+      const data = payload.data ? payload.data : payload;
+      if (!data) return;
+
+      if (data.warming_up || data.status === 'warming_up') {
+        setMessage(data.message || 'Worker is warming up...', 'muted');
+        return;
+      }
+
+      if (data.status === 'error') {
+        setMessage(`Worker error: ${data.error || 'unknown error'}`, 'red');
+      } else if (data.status === 'stale') {
+        setMessage('Worker snapshot is stale. Check worker process.', 'red');
+      } else {
+        setMessage('Live data stream active.', 'green');
+      }
+
+      const p = data.pnl || {};
+      const s = data.trade_stats || {};
+      const period = data.period || {};
+      const indicator = data.indicator || {};
+      const risk = data.risk || {};
+      const position = data.position || {};
+
+      document.getElementById('week').textContent = `Week: ${period.week_start || '--'} to ${period.week_end || '--'}`;
+      document.getElementById('trades').textContent = s.no_of_trades ?? '--';
+      document.getElementById('wl').textContent = `${s.wins ?? '--'}/${s.losses ?? '--'}`;
+      document.getElementById('winrate').textContent = `${s.win_rate ?? '--'}%`;
+
+      const grossEl = document.getElementById('gross');
+      const netEl = document.getElementById('net');
+      const dayEl = document.getElementById('day');
+      const chargesEl = document.getElementById('charges');
+
+      grossEl.textContent = p.gross ?? '--';
+      netEl.textContent = p.net ?? '--';
+      dayEl.textContent = p.day ?? '--';
+      chargesEl.textContent = p.charges ?? '--';
+      document.getElementById('recent').textContent = (s.recent || []).join(' | ') || '--';
+
+      colorize(grossEl, p.gross);
+      colorize(netEl, p.net);
+      colorize(dayEl, p.day);
+
+      document.getElementById('updated').textContent = `Updated: ${data.timestamp || new Date().toISOString()}`;
+
+      document.getElementById('signal').textContent = indicator.signal || '--';
+      document.getElementById('rsiMom').textContent = `${indicator.rsi ?? '--'} / ${indicator.momentum ?? '--'}`;
+      const sr = indicator.sr || {};
+      document.getElementById('sr').textContent = `${sr.support ?? '--'} / ${sr.resistance ?? '--'}`;
+      let mState = 'NORMAL';
+      if (indicator.exhausted) mState = 'EXHAUSTED';
+      else if (indicator.sideways) mState = 'SIDEWAYS';
+      document.getElementById('marketState').textContent = mState;
+
+      const riskEl = document.getElementById('riskState');
+      if (risk.buy_allowed === true) {
+        riskEl.textContent = 'BUY ALLOWED';
+        riskEl.className = 'green';
+      } else if (risk.buy_allowed === false) {
+        const why = risk.reason || (risk.cooloff_remaining ? `cooloff ${risk.cooloff_remaining}s` : 'locked');
+        riskEl.textContent = `BLOCKED (${why})`;
+        riskEl.className = 'red';
+      } else {
+        riskEl.textContent = '--';
+        riskEl.className = 'muted';
+      }
+
+      const posEl = document.getElementById('positionState');
+      if (position && position.symbol) {
+        posEl.textContent = `${position.symbol} (${position.qty}) @ ${position.entry_price ?? '--'}`;
+        posEl.className = 'red';
+      } else {
+        posEl.textContent = 'NO POSITION';
+        posEl.className = 'green';
+      }
+
+      if (!document.getElementById('indexLtp').value && indicator.index_ltp) {
+        document.getElementById('indexLtp').value = indicator.index_ltp;
+      }
+    }
+
+    function renderSystemStatus(status) {
+      if (!status) return;
+      const te = document.getElementById('tradingEnabled');
+      const wh = document.getElementById('workerHealth');
+      const ip = document.getElementById('serverIp');
+
+      te.textContent = status.trading_enabled ? 'YES' : 'NO';
+      te.className = status.trading_enabled ? 'green' : 'red';
+
+      if (status.worker_healthy === true) {
+        wh.textContent = 'HEALTHY';
+        wh.className = 'green';
+      } else if (status.worker_healthy === false) {
+        wh.textContent = 'UNHEALTHY';
+        wh.className = 'red';
+      } else {
+        wh.textContent = '--';
+        wh.className = 'muted';
+      }
+
+      ip.textContent = status.server_ip || '--';
+      ip.className = 'green';
+    }
+
+    async function loadSnapshot(token) {
+      const headers = token ? { 'X-API-Key': token } : {};
+      const r = await fetch('/api/monitor/snapshot', { headers });
+      if (!r.ok) {
+        if (r.status === 401) throw new Error('Unauthorized: invalid token');
+        if (r.status === 503) throw new Error('Server token is not configured');
+        throw new Error(`Snapshot failed (${r.status})`);
+      }
+      const j = await r.json();
+      render(j);
+    }
+
+    async function loadSystemStatus(token) {
+      const headers = token ? { 'X-API-Key': token } : {};
+      const r = await fetch('/api/system/status', { headers });
+      if (!r.ok) return;
+      const j = await r.json();
+      renderSystemStatus(j);
+    }
+
+    function _headers(token) {
+      return token ? { 'Content-Type': 'application/json', 'X-API-Key': token } : { 'Content-Type': 'application/json' };
+    }
+
+    async function executeTrade(action) {
+      const token = tokenEl.value.trim();
+      const trading_symbol = tradeSymbolEl.value.trim().toUpperCase();
+      const lots = Number(tradeLotsEl.value || '0');
+
+      if (!trading_symbol || trading_symbol.length < 5) {
+        setTradeResult('Please enter a valid trading symbol.', 'red');
+        return;
+      }
+      if (!Number.isFinite(lots) || lots < 1) {
+        setTradeResult('Lots must be >= 1.', 'red');
+        return;
+      }
+
+      const ok = confirm(`${action} ${lots} lot(s) for ${trading_symbol}?`);
+      if (!ok) return;
+
+      setTradeBusy(true, `${action} in progress...`);
+      setTradeResult('Sending order...', 'muted');
+
+      try {
+        const r = await fetch('/api/trade/action', {
+          method: 'POST',
+          headers: _headers(token),
+          body: JSON.stringify({ trading_symbol, lots, action })
+        });
+
+        const payload = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          const err = payload?.detail || `Request failed (${r.status})`;
+          setTradeResult(`Order failed: ${err}`, 'red');
+          tradeStatusEl.textContent = 'Failed';
+          tradeStatusEl.className = 'red';
+          return;
+        }
+
+        const broker = payload?.broker_response ? JSON.stringify(payload.broker_response, null, 2) : '{}';
+        setTradeResult(`Order accepted (${action}).\n${broker}`, 'green');
+        tradeStatusEl.textContent = 'Success';
+        tradeStatusEl.className = 'green';
+      } catch (e) {
+        setTradeResult(`Order error: ${String(e?.message || e)}`, 'red');
+        tradeStatusEl.textContent = 'Failed';
+        tradeStatusEl.className = 'red';
+      } finally {
+        setTradeBusy(false);
+      }
+    }
+
+    async function suggestSymbol() {
+      const token = tokenEl.value.trim();
+      const base_symbol = document.getElementById('baseSymbol').value;
+      const option_type = document.getElementById('optionType').value;
+      const index_ltp = Number(document.getElementById('indexLtp').value || '0');
+      const offset = Number(document.getElementById('strikeOffset').value || '0');
+
+      if (!Number.isFinite(index_ltp) || index_ltp <= 0) {
+        document.getElementById('suggestedSymbol').textContent = 'Suggested Symbol: enter valid index LTP';
+        document.getElementById('suggestedSymbol').className = 'red';
+        return;
+      }
+
+      try {
+        const r = await fetch('/api/symbol/suggest', {
+          method: 'POST',
+          headers: _headers(token),
+          body: JSON.stringify({ base_symbol, option_type, index_ltp, offset })
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          const d = j?.detail || `Suggestion failed (${r.status})`;
+          document.getElementById('suggestedSymbol').textContent = `Suggested Symbol: ${d}`;
+          document.getElementById('suggestedSymbol').className = 'red';
+          return;
+        }
+        document.getElementById('suggestedSymbol').textContent = `Suggested Symbol: ${j.symbol}`;
+        document.getElementById('suggestedSymbol').className = 'green';
+        tradeSymbolEl.value = j.symbol;
+      } catch (e) {
+        document.getElementById('suggestedSymbol').textContent = `Suggested Symbol: ${String(e?.message || e)}`;
+        document.getElementById('suggestedSymbol').className = 'red';
+      }
+    }
+
+    function scheduleReconnect() {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        if (lastToken !== null) {
+          connectWs(lastToken);
+        }
+      }, 2500);
+    }
+
+    function connectWs(token) {
+      if (ws) ws.close();
+      lastToken = token;
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const q = token ? `?token=${encodeURIComponent(token)}` : '';
+      ws = new WebSocket(`${proto}://${location.host}/ws/monitor${q}`);
+
+      ws.onopen = () => setStatus('Connected', 'green');
+      ws.onclose = () => {
+        setStatus('Disconnected', 'red');
+        scheduleReconnect();
+      };
+      ws.onerror = () => setStatus('WS Error', 'red');
+      ws.onmessage = (ev) => {
+        try { render(JSON.parse(ev.data)); } catch (_) {}
+      };
+    }
+
+    document.getElementById('connectBtn').addEventListener('click', async () => {
+      const token = tokenEl.value.trim();
+      localStorage.setItem('neo_web_token', token);
+      try {
+        await loadSnapshot(token);
+        await loadSystemStatus(token);
+        connectWs(token);
+      } catch (e) {
+        setStatus(String(e.message || e), 'red');
+        setMessage('Connection failed. Check token and worker status.', 'red');
+      }
+    });
+
+    buyBtn.addEventListener('click', () => executeTrade('BUY'));
+    exitBtn.addEventListener('click', () => executeTrade('EXIT'));
+    suggestBtn.addEventListener('click', suggestSymbol);
+
+    const saved = localStorage.getItem('neo_web_token') || '';
+    tokenEl.value = saved;
+  </script>
+</body>
+</html>
