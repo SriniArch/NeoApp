@@ -281,6 +281,12 @@ root.protocol("WM_DELETE_WINDOW", on_closing)
 # ---------------------------------------------------------
 # MAIN LAYOUT
 # ---------------------------------------------------------
+top_bar = ttk.Frame(root, padding=(8, 2))
+top_bar.pack(fill="x", side="top")
+
+date_time_label = ttk.Label(top_bar, text="", font=("Segoe UI", 10, "bold"))
+date_time_label.pack(side="right")
+
 main_container = ttk.Frame(root, padding=6)
 main_container.pack(fill=tk.BOTH, expand=True)
 
@@ -754,6 +760,12 @@ def toggle_auto_sell():
     else:
         auto_sell_btn.config(text="AUTO SELL: OFF", style="Auto.TButton")
         log_with_callback(log_cb, "⭕ Auto Sell: DISABLED")
+
+
+def update_datetime_label():
+    now_str = datetime.now().strftime("%d-%b-%Y %I:%M:%S %p")
+    date_time_label.config(text=now_str)
+    root.after(1000, update_datetime_label)
 
 
 def update_status_label():
@@ -1896,5 +1908,6 @@ def startup_sequence():
         log_with_callback(log_cb, f"❌ Startup Failed: {err_msg}")
 
 root.after(500, lambda: run_bg(startup_sequence))
+update_datetime_label()
 update_status_label()
 root.mainloop()
