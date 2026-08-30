@@ -8,6 +8,10 @@ on:
         required: false
         default: "main"
 
+concurrency:
+  group: deploy-azure-vm-production
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -21,8 +25,23 @@ jobs:
 
       - name: Build release bundle
         run: |
+          set -euo pipefail
+
           mkdir -p release
-          tar --exclude='.git' --exclude='.venv' --exclude='__pycache__' -czf release/neoapp.tar.gz .
+
+          tar \
+            --exclude='.git' \
+            --exclude='.venv' \
+            --exclude='venv' \
+            --exclude='__pycache__' \
+            --exclude='buy_disabled.json' \
+            --exclude='*.csv' \
+            --exclude='logs' \
+            --exclude='incoming' \
+            --exclude='releases' \
+            --exclude='current' \
+            -czf release/neoapp.tar.gz .
+
           sha256sum release/neoapp.tar.gz > release/neoapp.sha256
 
       - name: Upload bundle to VM
@@ -43,35 +62,117 @@ jobs:
           key: ${{ secrets.AZURE_VM_SSH_KEY }}
           port: ${{ secrets.AZURE_VM_PORT || 22 }}
           script: |
-            set -e
+            set -euo pipefail
+
             APP_DIR="${{ secrets.DEPLOY_PATH }}"
-            RELEASE_DIR="$APP_DIR/releases/$(date +%Y%m%d%H%M%S)"
             VENV_DIR="$APP_DIR/venv"
+            RUN_ID="${{ github.run_id }}"
+            RELEASE_DIR="$APP_DIR/releases/${RUN_ID}"
+
+            BUNDLE_FILE="$APP_DIR/incoming/neoapp.tar.gz"
+            CHECKSUM_FILE="$APP_DIR/incoming/neoapp.sha256"
+
+            echo "Deploying GitHub Actions run: $RUN_ID"
+            echo "Release directory: $RELEASE_DIR"
+
+            test -f "$BUNDLE_FILE"
+            test -f "$CHECKSUM_FILE"
+            test -x "$VENV_DIR/bin/python"
+            test -f /etc/neoapp2/neoapp.env
+
+            # Do not overwrite an existing release.
+            if [ -e "$RELEASE_DIR" ]; then
+              echo "Release already exists: $RELEASE_DIR"
+              exit 1
+            fi
+
             mkdir -p "$RELEASE_DIR"
 
-            cp "$APP_DIR/incoming/release/neoapp.tar.gz" "$RELEASE_DIR/"
-            cp "$APP_DIR/incoming/release/neoapp.sha256" "$RELEASE_DIR/"
+            # Verify the uploaded bundle before extracting it.
+            cd "$APP_DIR/incoming"
+            sha256sum -c neoapp.sha256
+
+            cp "$BUNDLE_FILE" "$RELEASE_DIR/neoapp.tar.gz"
+            cp "$CHECKSUM_FILE" "$RELEASE_DIR/neoapp.sha256"
 
             cd "$RELEASE_DIR"
             sha256sum -c neoapp.sha256
             tar -xzf neoapp.tar.gz
 
+            rm -f "$RELEASE_DIR/neoapp.tar.gz"
+            rm -f "$RELEASE_DIR/neoapp.sha256"
+
+            # Runtime-generated files/directories live outside releases.
+            # Link them into the release so the application sees the
+            # existing runtime state while deployments remain immutable.
+            if [ -e "$APP_DIR/buy_disabled.json" ]; then
+              ln -s "$APP_DIR/buy_disabled.json" "$RELEASE_DIR/buy_disabled.json"
+            fi
+
+            if [ -d "$APP_DIR/logs" ]; then
+              ln -s "$APP_DIR/logs" "$RELEASE_DIR/logs"
+            fi
+
+            if [ -d "$APP_DIR/incoming" ]; then
+              ln -s "$APP_DIR/incoming" "$RELEASE_DIR/incoming"
+            fi
+
+            if [ -f "$APP_DIR/nse_fo.csv" ]; then
+              ln -s "$APP_DIR/nse_fo.csv" "$RELEASE_DIR/nse_fo.csv"
+            fi
+
+            # Make sure the application user can read and execute
+            # the newly-created release.
+            chgrp -R neoapp "$RELEASE_DIR"
+            chmod -R g+rX "$RELEASE_DIR"
+
+            # Install/update Python dependencies in the existing VM venv.
+            "$VENV_DIR/bin/pip" install --upgrade pip
+            "$VENV_DIR/bin/pip" install \
+              -r "$RELEASE_DIR/requirements.txt" \
+              -r "$RELEASE_DIR/requirements-web.txt"
+
+            # Switch current only after the release has been completely
+            # extracted and dependencies are installed.
             ln -sfn "$RELEASE_DIR" "$APP_DIR/current"
 
-            if [ ! -x "$VENV_DIR/bin/python" ]; then
-              python3 -m venv "$VENV_DIR"
-            fi
+            # Restart only the application services.
+            sudo -n /usr/bin/systemctl restart neo-worker.service
+            sudo -n /usr/bin/systemctl restart neo-fastapi.service
 
-            "$VENV_DIR/bin/pip" install --upgrade pip
-            "$VENV_DIR/bin/pip" install -r "$APP_DIR/current/requirements.txt" -r "$APP_DIR/current/requirements-web.txt"
+            # Verify both services.
+            test "$(sudo -n /usr/bin/systemctl is-active neo-worker.service)" = "active"
+            test "$(sudo -n /usr/bin/systemctl is-active neo-fastapi.service)" = "active"
 
-            sudo systemctl restart neo-worker.service
-            sudo systemctl restart neo-fastapi.service
-            sudo systemctl reload nginx
+            # Verify the local application health endpoint.
+            for i in $(seq 1 15); do
+              if curl -fsS http://127.0.0.1:8000/health >/dev/null; then
+                echo "Local health check passed."
+                break
+              fi
 
-            sleep 5
+              if [ "$i" -eq 15 ]; then
+                echo "Local health check failed."
+                sudo -n /usr/bin/systemctl status neo-fastapi.service || true
+                sudo -n /usr/bin/systemctl status neo-worker.service || true
+                exit 1
+              fi
+
+              sleep 2
+            done
+
             curl -fsS http://127.0.0.1:8000/health
 
+            # Optional external health check.
             if [ -n "${{ secrets.AZURE_PUBLIC_URL }}" ]; then
-              curl -fsS "${{ secrets.AZURE_PUBLIC_URL }}/health"
+              PUBLIC_URL="${{ secrets.AZURE_PUBLIC_URL }}"
+              PUBLIC_URL="${PUBLIC_URL%/}"
+
+              echo "Checking: ${PUBLIC_URL}/health"
+              curl -fsS "${PUBLIC_URL}/health"
             fi
+
+            echo
+            echo "Deployment successful."
+            echo "Current release:"
+            readlink -f "$APP_DIR/current"
